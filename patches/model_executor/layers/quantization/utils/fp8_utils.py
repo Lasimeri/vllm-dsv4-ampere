@@ -1617,10 +1617,51 @@ def process_fp8_input_tensor_strategy_moe(
 # Triton kernel that uses tl.float8e4nv, which Triton refuses to compile on
 # SM<89. Wrapping as registered torch.library ops makes them opaque so the
 # fp8 cast lives outside any Inductor-traced region.
+#
+# CUDAGRAPH SAFETY: these ops return (data, scale) tuples that flow into
+# captured PIECEWISE segments downstream. Captured segments bind to inputs
+# by .data_ptr() at capture time and read from those exact addresses at
+# replay. Fresh allocations from the regular caching allocator give a new
+# address every call, so the captured segment reads stale memory at replay
+# (manifests as deterministic Chinese-token gibberish during decode).
+#
+# Fix: cache output buffers by (shape, stride, dtype, device) and copy the
+# freshly-computed result into the cached buffer before returning. The
+# returned tensor's address is now stable across calls -- the captured
+# segment's recorded read pointer remains valid at replay.
 try:
     from vllm.utils.torch_utils import (
         direct_register_custom_op as _dgq_direct_register_custom_op,
     )
+
+    # Shared cache for stable output buffers. Keyed by output tensor
+    # geometry so different call sites with the same shape share a buffer
+    # safely (the cudagraph stream serializes captured-segment reads
+    # against the next opaque-op write).
+    _sm86_quant_buf_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _stable_buf_pair(
+        data_ref: torch.Tensor, scale_ref: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (
+            tuple(data_ref.shape), tuple(data_ref.stride()), str(data_ref.dtype),
+            tuple(scale_ref.shape), tuple(scale_ref.stride()), str(scale_ref.dtype),
+            data_ref.device.index if data_ref.device.type == "cuda" else -1,
+        )
+        cached = _sm86_quant_buf_cache.get(key)
+        if cached is None:
+            cached = (
+                torch.empty_strided(
+                    data_ref.shape, data_ref.stride(),
+                    dtype=data_ref.dtype, device=data_ref.device,
+                ),
+                torch.empty_strided(
+                    scale_ref.shape, scale_ref.stride(),
+                    dtype=scale_ref.dtype, device=scale_ref.device,
+                ),
+            )
+            _sm86_quant_buf_cache[key] = cached
+        return cached
 
     def _per_token_group_quant_fp8_sm86_op(
         x: torch.Tensor,
@@ -1630,7 +1671,7 @@ try:
         tma_aligned_scales: bool,
         use_ue8m0: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _per_token_group_quant_fp8_impl(
+        result_data, result_scale = _per_token_group_quant_fp8_impl(
             x,
             group_size=group_size,
             eps=eps,
@@ -1640,6 +1681,10 @@ try:
             out_q=None,
             use_ue8m0=use_ue8m0,
         )
+        out_data, out_scale = _stable_buf_pair(result_data, result_scale)
+        out_data.copy_(result_data)
+        out_scale.copy_(result_scale)
+        return out_data, out_scale
 
     def _per_token_group_quant_fp8_sm86_op_fake(
         x: torch.Tensor,
@@ -1668,13 +1713,17 @@ try:
         eps: float,
         use_ue8m0: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _per_token_group_quant_fp8_packed_for_deepgemm_impl(
+        result_data, result_scale = _per_token_group_quant_fp8_packed_for_deepgemm_impl(
             x,
             group_size=group_size,
             eps=eps,
             use_ue8m0=use_ue8m0,
             out_q=None,
         )
+        out_data, out_scale = _stable_buf_pair(result_data, result_scale)
+        out_data.copy_(result_data)
+        out_scale.copy_(result_scale)
+        return out_data, out_scale
 
     def _per_token_group_quant_fp8_packed_deepgemm_sm86_op_fake(
         x: torch.Tensor,

@@ -42,7 +42,7 @@ exec /home/lasi/vllm-env/bin/vllm serve "$MODEL_PATH" \
   --cpu-offload-gb 14.81 \
   --tensor-parallel-size 8 \
   --enable-expert-parallel \
-  --enforce-eager \
+  --compilation-config '{"cudagraph_mode": "PIECEWISE"}' \
   --max-num-seqs 1 \
   --max-model-len 100000 \
   --enable-chunked-prefill \

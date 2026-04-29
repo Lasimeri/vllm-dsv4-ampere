@@ -2,16 +2,15 @@
 
 Patches that let **DeepSeek-V4-Flash** run on **Ampere SM 8.6** GPUs (RTX 30xx) under vLLM.
 
-Status: **working** -- generates coherent text, follows instructions, emits valid OpenAI-compatible tool calls. **~1.94 tok/s** sustained decode at short context on 8x RTX 3080 20GB (vLLM 0.1.dev15830+g8d599d76a, eager mode).
+Status: **working with PIECEWISE cudagraph capture**. Generates coherent text, follows instructions, emits valid OpenAI-compatible tool calls. **~2.58 tok/s** sustained decode at short context on 8x RTX 3080 20GB (vLLM 0.1.dev15830+g8d599d76a, PIECEWISE compile + capture). Eager-mode fallback runs at ~2.01 tok/s.
 
 This is a starting point for the community. Upstream vLLM rejects FP8/sparse-MLA/DeepGEMM support on SM<90 ("SM80 support better lives in a fork", per @youkaichao on PR #40906). This repo replaces every blocking kernel with either a pure-PyTorch reference path or a hand-written SM86 Triton kernel that engages BF16 tensor cores.
 
 ## What this is not
 
-- Fast in absolute terms. ~1.94 tok/s, not 30. Long-context prefill is also slower than upstream because much of the path runs through Python-vectorized GPU code instead of fused Triton kernels.
+- Fast in absolute terms. ~2.58 tok/s, not 30. Long-context prefill is also slower than upstream because much of the path runs through Python-vectorized GPU code instead of fused Triton kernels.
 - A merge candidate. Maintainers explicitly closed analogous PRs for SM80 (#40906) and reverted earlier sparse-MLA patches (#37968 reverted #35271).
 - Stable across vllm versions. Patches were captured against vllm `0.1.dev15830+g8d599d76a` on 2026-04-29. Any meaningful upstream change to the touched files will need to be reconciled.
-- Cudagraph-clean. PIECEWISE capture currently corrupts decode output (see "cudagraph status" below). The wrapper ships `--enforce-eager` as the working state.
 
 ## What this is
 
@@ -107,11 +106,22 @@ Three kernels were written by hand for SM86 (no native fp8e4nv, no TMA, no FP4) 
 - **K10-dequant** -- fp8 K-cache dequant inner kernel -- 7.01x kernel-isolated
   `third_party/flashmla/flash_mla_interface.py`
 
-Aggregate E2E gain: 1.67 -> 1.94 tok/s (+16%).
+Aggregate E2E gain (eager): 1.67 -> 2.01 tok/s (+20%, accounting for cache-stable allocation reuse from the cudagraph fix).
+With PIECEWISE capture: 1.67 -> 2.58 tok/s (+54%).
 
 K8/K9 (compressor) Triton ports were attempted and reverted: bit-exact parity but 44% E2E regression because per-token launch overhead dominates when most tokens early-exit on the compress_ratio condition. The reference Triton code is preserved in-file but dispatch points back to the pyref.
 
 A full K10 FlashAttention-2-style decode kernel is still future work; the current K10 only swaps the FP8 dequant inner kernel.
+
+## PIECEWISE cudagraph fix
+
+The repo ships PIECEWISE compile + capture as the default mode (configured in `wrapper-vllm-deepseek.sh`). Capture works because `per_token_group_quant_fp8_sm86` (and its packed-deepgemm sibling) now route their `(data, scale)` outputs through a shape-keyed persistent buffer cache.
+
+Diagnosis was reached by replacing the gated debug assertion in `vllm/compilation/cuda_graph.py:341` with an always-on diagnostic that logged the runnable identity, batch descriptor, and shape of every input whose `data_ptr()` differed between capture and replay. A single 5-token Vichy probe surfaced 688 mismatched-input segments across 8 worker ranks, all with the same fingerprint: index 0 was a `(1, N) float8_e4m3fn` tensor and index 2 was a `(1, N/128) float32` tensor (groups of 128, one fp32 scale per group). That signature uniquely identifies the per-token-group quantizer's `(data, scale)` return tuple.
+
+Each call to `per_token_group_quant_fp8_sm86` was allocating fresh tensors. PIECEWISE binds segment inputs to live `data_ptr()` recorded at capture time (see `vllm/compilation/cuda_graph.py:279-282`), and `cudagraph_copy_inputs=True` only handles tensors flagged as symbolic-shape (which static-shape decode tensors are not, see `vllm/compilation/backends.py:1274-1279`). So every replay read from the warmup-time address while the live tensor sat at a new address. The fix: a `_stable_buf_pair(data_ref, scale_ref)` helper keyed by `(shape, stride, dtype, device)` that reuses persistent buffers across calls, with a single `.copy_()` to populate them from the freshly-computed result. Patch lives in `patches/model_executor/layers/quantization/utils/fp8_utils.py` near the SM86 op registrations.
+
+Eager-mode behavior is unaffected (the cache reuse is harmless when capture is off; net effect is a small bf16 memcpy per quant call).
 
 ## Known limitations
 
@@ -119,7 +129,6 @@ A full K10 FlashAttention-2-style decode kernel is still future work; the curren
 - **Q/K dim mismatch** (576 vs 512) handled via prefix dot product; trailing 64 q_pe rope dims dropped. Approximate but coherent in practice.
 - **Long-context prefill** is bounded by per-call vectorized work, not per-token. Still slower than tuned kernels.
 - **Marlin MoE** is the SM86 fallback for FP4 expert weights. Non-standard MXFP4 layouts will break it.
-- **PIECEWISE cudagraph capture** corrupts decode output. Capture itself succeeds and reaches ~2.57 tok/s, but produces deterministic Chinese-token gibberish ("Vr 1, ...") starting at the first decoded token. Token 0 (prefill) remains correct. Suspected fresh-allocation-inside-forward at `v1/attention/backends/mla/flashmla_sparse.py:870` (`attn_out = q.new_empty(...)` returning a new address every call). Wrapper defaults to `--enforce-eager` as the working state until this is fixed.
 
 ## Why this exists
 

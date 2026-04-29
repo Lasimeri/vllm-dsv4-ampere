@@ -1,10 +1,11 @@
 DeepSeek-V4-Flash on Ampere SM 8.6, vLLM patch snapshot
 ========================================================
 
-Snapshot taken: 2026-04-29 ~16:00 CDT
+Snapshot taken: 2026-04-29 ~17:36 CDT
 Working state:  generates coherent text, follows instructions,
-                emits valid tool_calls, ~1.94 tok/s sustained at
-                short context (Vichy prompt, finish=stop).
+                emits valid tool_calls, ~2.58 tok/s sustained at
+                short context with PIECEWISE cudagraph capture
+                (Vichy prompt, finish=stop).
 Hardware:       8x RTX 3080 20GB (Ampere SM 8.6, 160 GB total VRAM)
 Model:          deepseek-ai/DeepSeek-V4-Flash (FP4 + FP8 + BF16 mixed)
 vLLM base:      0.1.dev15830+g8d599d76a (commit 8d599d76a)
@@ -15,7 +16,9 @@ Throughput history
   1.64 tok/s   prior snapshot (2026-04-27): all FP32 to BF16 wins,
                per-token Python loops vectorized, batched scatter/gather
   1.67 tok/s   pyref-only baseline (2026-04-29 morning)
-  1.94 tok/s   K6 + K7 + K10-dequant Triton kernels (this snapshot)
+  1.94 tok/s   K6 + K7 + K10-dequant Triton kernels (eager)
+  2.01 tok/s   eager with stable-quant-buffer cache (this snapshot, eager)
+  2.58 tok/s   PIECEWISE cudagraph capture (this snapshot, default)
 
 Diff vs the 2026-04-27 patch set
 --------------------------------
@@ -62,19 +65,37 @@ HC prenorm GEMM, MHC TileLang replacements.
 
 cudagraph status
 ----------------
-PIECEWISE cudagraph capture succeeds and reaches ~2.57 tok/s
-(+33% over the eager 1.94), but produces deterministic garbage
-output ("Vr 1, ... Chinese tokens repeating"). Token 0 (prefill)
-is correct; token 1 onward (first replayed decode step) is wrong
-in a deterministic way regardless of K10 Triton vs pyref, prefix
-caching, async scheduling, and copy_inputs flags.
+PIECEWISE cudagraph capture is now FIXED and is the default mode.
+Throughput: 2.58 tok/s sustained at decode (vs 2.01 tok/s eager,
++28%). Output is coherent and factually accurate.
 
-Active investigation suspects fresh-allocation-inside-forward in
-`v1/attention/backends/mla/flashmla_sparse.py:870`
-(`attn_out = q.new_empty(...)` produces a different address every
-call, breaking the captured graph's recorded read pointers).
-This is NOT YET FIXED in this snapshot. Wrapper ships
-`--enforce-eager` as the working state.
+Root cause: `per_token_group_quant_fp8_sm86` and its packed-
+deepgemm sibling returned freshly-allocated (data, scale) tuples
+on each call. PIECEWISE binds segment inputs by `data_ptr()`
+recorded at capture time (cuda_graph.py:279-282); replay reads
+from the warmup-time address, but the live tensor was at a new
+address by then -> stale read -> deterministic Chinese-token
+gibberish ("Vr 1, ..." pre-fix).
+
+Diagnosis: temporary always-on diagnostic patch on the gated
+debug assertion at cuda_graph.py:341 surfaced 688 mismatched-
+input segments per 5-token decode probe across 8 worker ranks.
+All mismatches had identical fingerprint: index 0 was a
+(1, N) float8_e4m3fn tensor and index 2 was a (1, N/128) float32
+tensor (groups of 128, one fp32 scale per group). Unique
+signature of the per-token-group quantizer's return tuple.
+
+Fix: a `_stable_buf_pair(data_ref, scale_ref)` helper keyed by
+(shape, stride, dtype, device) that reuses persistent buffers
+across calls, with a single `.copy_()` to populate them from the
+freshly-computed result. Patch at fp8_utils.py near the SM86 op
+registrations. Eager-mode behavior unaffected (the cache reuse is
+harmless when capture is off).
+
+Why `cudagraph_copy_inputs=True` did not work: it only handles
+inputs flagged as symbolic-shape (backends.py:1274-1279). Static-
+shape decode tensors at batch=1 are not symbolic, so the copy
+mechanism never fires.
 
 How to restore
 --------------
