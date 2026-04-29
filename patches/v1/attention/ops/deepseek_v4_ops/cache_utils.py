@@ -234,8 +234,8 @@ def quantize_and_insert_k_cache(
     try:
         from vllm.utils.deep_gemm import _use_sm86_reference
         if _use_sm86_reference():
-            return _quantize_and_insert_k_cache_pyref(
-                k, k_cache, slot_mapping, block_size
+            return torch.ops.vllm.deepseek_v4_quant_insert_k_cache_sm86(
+                k, k_cache, slot_mapping, block_size,
             )
     except ImportError:
         pass
@@ -496,7 +496,7 @@ def dequantize_and_gather_k_cache(
     try:
         from vllm.utils.deep_gemm import _use_sm86_reference
         if _use_sm86_reference():
-            return _dequantize_and_gather_k_cache_pyref(
+            return torch.ops.vllm.deepseek_v4_dequant_gather_k_cache_sm86(
                 out, k_cache, seq_lens, gather_lens,
                 block_table, block_size, offset,
             )
@@ -747,3 +747,70 @@ def _combine_topk_swa_indices_kernel(
 
         combined_len = topk_len + swa_len
         tl.store(combined_lens_ptr + token_idx, combined_len)
+
+
+# ─── SM86 opaque-op wrappers ────────────────────────────────────────────────
+# Wrap pyref dispatch as registered torch.library custom ops so PIECEWISE
+# cudagraph capture can split at these boundaries. Bodies invoke .nonzero()
+# / .item() / mutating writes that are forbidden inside cudagraph capture
+# regions. The op names are registered with config.compilation._attention_ops
+# so PIECEWISE auto-splits here.
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    def _quant_insert_k_cache_sm86_op(
+        k: torch.Tensor,
+        k_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        _quantize_and_insert_k_cache_pyref(k, k_cache, slot_mapping, block_size)
+
+    def _quant_insert_k_cache_sm86_op_fake(
+        k: torch.Tensor,
+        k_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        return None
+
+    direct_register_custom_op(
+        op_name="deepseek_v4_quant_insert_k_cache_sm86",
+        op_func=_quant_insert_k_cache_sm86_op,
+        mutates_args=["k_cache"],
+        fake_impl=_quant_insert_k_cache_sm86_op_fake,
+    )
+
+    def _dequant_gather_k_cache_sm86_op(
+        out: torch.Tensor,
+        k_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        gather_lens: torch.Tensor | None,
+        block_table: torch.Tensor,
+        block_size: int,
+        offset: int,
+    ) -> None:
+        _dequantize_and_gather_k_cache_pyref(
+            out, k_cache, seq_lens, gather_lens,
+            block_table, block_size, offset,
+        )
+
+    def _dequant_gather_k_cache_sm86_op_fake(
+        out: torch.Tensor,
+        k_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        gather_lens: torch.Tensor | None,
+        block_table: torch.Tensor,
+        block_size: int,
+        offset: int,
+    ) -> None:
+        return None
+
+    direct_register_custom_op(
+        op_name="deepseek_v4_dequant_gather_k_cache_sm86",
+        op_func=_dequant_gather_k_cache_sm86_op,
+        mutates_args=["out"],
+        fake_impl=_dequant_gather_k_cache_sm86_op_fake,
+    )
+except Exception:
+    pass

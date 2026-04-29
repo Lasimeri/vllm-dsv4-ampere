@@ -347,47 +347,41 @@ class DeepseekCompressor(nn.Module):
         except ImportError:
             sm86 = False
         if sm86 and self.head_dim == 512:
-            from vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache import (
-                _fused_kv_compress_sparse_attn_pyref,
-            )
-            _fused_kv_compress_sparse_attn_pyref(
+            torch.ops.vllm.deepseek_v4_compress_sparse_attn_sm86(
                 state_cache, token_to_req_indices, positions, slot_mapping,
                 block_table, block_size,
                 self.norm.weight, self.rms_norm_eps,
                 cos_sin_cache,
                 kv_cache, k_cache_metadata.slot_mapping, kv_cache.shape[1],
-                head_size=self.head_dim,
-                state_width=state_width,
-                compress_ratio=self.compress_ratio,
-                overlap=self.overlap,
-                rope_head_dim=self.rope_head_dim,
-                fp8_max=448.0,
-                quant_block=self._quant_block,
-                token_stride=self._token_stride,
-                scale_dim=self._scale_dim,
+                self.head_dim,
+                state_width,
+                self.compress_ratio,
+                bool(self.overlap),
+                self.rope_head_dim,
+                448.0,
+                self._quant_block,
+                self._token_stride,
+                self._scale_dim,
             )
             return
         # head_dim=128 with scale_dim=4 = single-fp32-scale indexer FP8 path.
         # scale_dim != 4 (typically head_dim/MXFP4_BLOCK_SIZE) is MXFP4, which we don't use.
         if sm86 and self.head_dim == 128 and self._scale_dim == 4:
-            from vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache import (
-                _fused_kv_compress_indexer_attn_pyref,
-            )
-            _fused_kv_compress_indexer_attn_pyref(
+            torch.ops.vllm.deepseek_v4_compress_indexer_attn_sm86(
                 state_cache, token_to_req_indices, positions, slot_mapping,
                 block_table, block_size,
                 self.norm.weight, self.rms_norm_eps,
                 cos_sin_cache,
                 kv_cache, k_cache_metadata.slot_mapping, kv_cache.shape[1],
-                head_size=self.head_dim,
-                state_width=state_width,
-                compress_ratio=self.compress_ratio,
-                overlap=self.overlap,
-                rope_head_dim=self.rope_head_dim,
-                fp8_max=448.0,
-                quant_block=self._quant_block,
-                token_stride=self._token_stride,
-                scale_dim=self._scale_dim,
+                self.head_dim,
+                state_width,
+                self.compress_ratio,
+                bool(self.overlap),
+                self.rope_head_dim,
+                448.0,
+                self._quant_block,
+                self._token_stride,
+                self._scale_dim,
             )
             return
 

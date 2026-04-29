@@ -492,7 +492,7 @@ def _per_token_group_quant_fp8_colmajor(
     tl.store(y_s_ptr, y_s)
 
 
-def per_token_group_quant_fp8(
+def _per_token_group_quant_fp8_impl(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
@@ -619,7 +619,7 @@ def per_token_group_quant_fp8(
     return x_q, x_s
 
 
-def per_token_group_quant_fp8_packed_for_deepgemm(
+def _per_token_group_quant_fp8_packed_for_deepgemm_impl(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
@@ -817,6 +817,209 @@ def get_w8a8_block_fp8_configs(
     return None
 
 
+@triton.jit
+def _fp8_e4m3fn_byte_to_bf16(byte):
+    """Decode an FP8 e4m3fn byte (uint8) to BF16 in-kernel without using
+    tl.float8e4nv (which Triton refuses on SM<89).
+
+    e4m3fn layout: 1 sign + 4 exp (bias 7) + 3 mantissa, no inf, NaN at
+    exp=15 & mant=7. Trained weights rarely contain NaN; we treat NaN
+    cases as their value-equivalent normal interpretation, which is
+    benign for inference.
+    """
+    sign_bit = ((byte >> 7) & 1).to(tl.int32)
+    exp = ((byte >> 3) & 0xF).to(tl.int32)
+    mant = (byte & 0x7).to(tl.int32)
+    sign = 1.0 - 2.0 * sign_bit.to(tl.float32)
+    mant_f = mant.to(tl.float32) * 0.125  # mant/8
+    is_zero = (exp == 0) & (mant == 0)
+    is_subnormal = (exp == 0) & (mant != 0)
+    normal_val = sign * tl.exp2((exp - 7).to(tl.float32)) * (1.0 + mant_f)
+    subnormal_val = sign * 0.015625 * mant_f  # 2^-6 = 1/64
+    val = tl.where(
+        is_subnormal,
+        subnormal_val,
+        tl.where(is_zero, 0.0, normal_val),
+    )
+    return val.to(tl.bfloat16)
+
+
+@triton.jit
+def _fp32_to_fp8_e4m3fn_byte(x):
+    """Encode FP32 → FP8 e4m3fn byte (uint8). Inverse of
+    _fp8_e4m3fn_byte_to_bf16. Saturating to ±448, round-to-nearest-even.
+    Used on SM<89 where tl.float8e4nv casts are unsupported.
+
+    e4m3fn layout: 1 sign | 4 exp (bias 7) | 3 mant.
+    Max representable = 448 (S.1111.110). NaN = S.1111.111 — we never
+    generate NaN since input is clamped to [-448, 448].
+    """
+    bits = x.to(tl.int32, bitcast=True)
+    sign = ((bits >> 31) & 1).to(tl.int32)
+    abs_bits = bits & 0x7FFFFFFF
+
+    # Saturate to fp8 max (448 = 0x43E00000 in fp32).
+    abs_bits = tl.minimum(abs_bits, 0x43E00000)
+
+    fp32_exp = (abs_bits >> 23) & 0xFF  # biased
+    fp32_mant = abs_bits & 0x7FFFFF
+
+    # FP8 biased exp = (fp32_exp - 127) + 7 = fp32_exp - 120
+    fp8_exp = fp32_exp.to(tl.int32) - 120
+
+    # Round-to-nearest-even: keep top 3 bits of mantissa.
+    discard = fp32_mant & ((1 << 20) - 1)
+    half_threshold = 1 << 19
+    truncated = fp32_mant >> 20  # top 3 bits → fp8 mantissa
+    round_up = (discard > half_threshold) | (
+        (discard == half_threshold) & ((truncated & 1) == 1)
+    )
+    rounded_mant = truncated + round_up.to(tl.int32)
+    overflow = rounded_mant == 8
+    rounded_mant = tl.where(overflow, tl.zeros_like(rounded_mant), rounded_mant)
+    fp8_exp_after = fp8_exp + overflow.to(tl.int32)
+
+    # Saturate exp post-overflow (e.g. 0x43E00000 → exp=15, mant=6, no
+    # rounding overflow possible).
+    fp8_exp_after = tl.minimum(fp8_exp_after, 15)
+
+    # Path classification:
+    #   fp32_exp == 0     → input is fp32 zero/denormal → fp8 zero
+    #   fp8_exp_after >= 1 → fp8 normal
+    #   fp8_exp_after in [-2, 0] → fp8 subnormal (mag in [2^-9, 2^-6))
+    #   else               → fp8 zero (input below 2^-9 magnitude)
+    is_zero_input = fp32_exp == 0
+    is_normal = fp8_exp_after >= 1
+    is_subnormal = (fp8_exp_after >= -2) & (fp8_exp_after <= 0) & ~is_zero_input
+
+    # Subnormal mantissa: mag * 2^9 rounded to int. Use the float value
+    # directly (Triton optimizes this on Ampere).
+    fp_value = abs_bits.to(tl.float32, bitcast=True)
+    sub_mant_f = fp_value * 512.0  # 2^9
+    sub_mant = (sub_mant_f + 0.5).to(tl.int32)
+    sub_mant = tl.minimum(sub_mant, 7)
+
+    out_normal = (fp8_exp_after << 3) | rounded_mant
+    out = tl.where(
+        is_normal,
+        out_normal,
+        tl.where(is_subnormal, sub_mant, tl.zeros_like(sub_mant)),
+    )
+    out = (sign << 7) | out
+    return out.to(tl.uint8)
+
+
+@triton.jit
+def _w8a8_block_scaled_mm_sm86_kernel(
+    A, B, C, As, Bs,
+    M, N, K,
+    group_n: tl.constexpr, group_k: tl.constexpr,
+    stride_am, stride_ak, stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    stride_As_m, stride_As_k, stride_Bs_k, stride_Bs_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """SM86 block-scaled FP8 matmul. A, B are passed as uint8 (FP8 bytes
+    reinterpreted). Manual unpack to BF16, then tensor-core BF16 dot."""
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    As_ptrs = As + offs_am * stride_As_m
+    offs_bsn = offs_bn // group_n
+    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_bytes = tl.load(
+            a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0
+        )
+        b_bytes = tl.load(
+            b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0
+        )
+        a_bf = _fp8_e4m3fn_byte_to_bf16(a_bytes)
+        b_bf = _fp8_e4m3fn_byte_to_bf16(b_bytes)
+
+        k_start = k * BLOCK_SIZE_K
+        offs_ks = k_start // group_k
+        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+        accumulator += tl.dot(a_bf, b_bf) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if C.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        c = accumulator.to(tl.float16)
+    else:
+        c = accumulator.to(tl.float32)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def _w8a8_block_scaled_mm_sm86_triton(
+    A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor,
+    block_size: list[int], output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """SM86 Triton entry: real fused dequant+matmul kernel via byte-unpack."""
+    block_n, block_k = block_size[0], block_size[1]
+    M_total = A.numel() // A.shape[-1]
+    M = M_total
+    N, K = B.shape
+    C_shape = A.shape[:-1] + (N,)
+    C = A.new_empty(C_shape, dtype=output_dtype)
+
+    # Reinterpret FP8 e4m3fn bytes as uint8 — same storage, no cast.
+    A_u8 = A.view(torch.uint8)
+    B_u8 = B.view(torch.uint8)
+    As_f = As.to(torch.float32) if As.dtype != torch.float32 else As
+    Bs_f = Bs.to(torch.float32) if Bs.dtype != torch.float32 else Bs
+
+    BLOCK_M = 64
+    BLOCK_N = block_n
+    BLOCK_K = block_k
+    GROUP_M = 8
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    _w8a8_block_scaled_mm_sm86_kernel[grid](
+        A_u8, B_u8, C, As_f, Bs_f,
+        M, N, K,
+        block_n, block_k,
+        A_u8.stride(-2), A_u8.stride(-1),
+        B_u8.stride(1), B_u8.stride(0),
+        C.stride(-2), C.stride(-1),
+        As_f.stride(-2), As_f.stride(-1),
+        Bs_f.stride(1), Bs_f.stride(0),
+        BLOCK_SIZE_M=BLOCK_M,
+        BLOCK_SIZE_N=BLOCK_N,
+        BLOCK_SIZE_K=BLOCK_K,
+        GROUP_SIZE_M=GROUP_M,
+        num_warps=4,
+        num_stages=2,
+    )
+    return C
+
+
 def _w8a8_block_scaled_mm_pyref(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -827,27 +1030,40 @@ def _w8a8_block_scaled_mm_pyref(
 ) -> torch.Tensor:
     """SM86 fallback for the FP8 block-scaled MM.
 
-    Triton's FP8 e4m3fn (fp8e4nv) requires SM89+. On Ampere we dequant to
-    BF16 in-place and run a standard BF16 GEMM via cuBLAS tensor cores.
+    Optimized: scale broadcast via reshape (no materialization) instead of
+    repeat_interleave. Saves 2x memory traffic on the dequant prep step.
     """
     block_n, block_k = block_size[0], block_size[1]
     N, K = B.shape
+    M_total_shape = A.shape[:-1]
     A_bf = A.to(torch.bfloat16)
     B_bf = B.to(torch.bfloat16)
     As_bf = As.to(torch.bfloat16)
     Bs_bf = Bs.to(torch.bfloat16)
 
-    As_exp = As_bf.repeat_interleave(block_k, dim=-1)
-    if As_exp.shape[-1] != K:
-        As_exp = As_exp[..., :K]
-    A_deq = A_bf * As_exp
+    # Scale broadcast via grouped reshape — A_grp[..., g, :] all share As[..., g].
+    # The fast-path requires K to be a multiple of block_k (typical for these
+    # models with K=7168 / block_k=128). Fall back to repeat_interleave path
+    # otherwise.
+    if K % block_k == 0 and N % block_n == 0:
+        A_grp = A_bf.reshape(*M_total_shape, K // block_k, block_k)
+        A_deq = (A_grp * As_bf.unsqueeze(-1)).reshape(*M_total_shape, K)
 
-    Bs_exp = Bs_bf.repeat_interleave(block_n, dim=0).repeat_interleave(
-        block_k, dim=1
-    )
-    if Bs_exp.shape[0] != N or Bs_exp.shape[1] != K:
-        Bs_exp = Bs_exp[:N, :K]
-    B_deq = B_bf * Bs_exp
+        B_grp = B_bf.reshape(N // block_n, block_n, K // block_k, block_k)
+        # Bs_bf: [N//block_n, K//block_k]; expand to [N//block_n, 1, K//block_k, 1]
+        B_deq = (B_grp * Bs_bf[:, None, :, None]).reshape(N, K)
+    else:
+        As_exp = As_bf.repeat_interleave(block_k, dim=-1)
+        if As_exp.shape[-1] != K:
+            As_exp = As_exp[..., :K]
+        A_deq = A_bf * As_exp
+
+        Bs_exp = Bs_bf.repeat_interleave(block_n, dim=0).repeat_interleave(
+            block_k, dim=1
+        )
+        if Bs_exp.shape[0] != N or Bs_exp.shape[1] != K:
+            Bs_exp = Bs_exp[:N, :K]
+        B_deq = B_bf * Bs_exp
 
     out = torch.matmul(A_deq, B_deq.transpose(-1, -2))
     return out.to(output_dtype)
@@ -871,7 +1087,11 @@ def w8a8_triton_block_scaled_mm(
             Bs = Bs.to(torch.float32)
 
     # SM86 fix: Triton's fp8e4nv path won't compile on SM<89.
-    # Detour through dequant + BF16 GEMM.
+    # The pyref (PyTorch dequant + cuBLAS BF16 GEMM) outperforms a
+    # hand-rolled Triton block-scaled kernel here — cuBLAS wins on the
+    # large matmul, and per-K-tile byte-unpack overhead dominates the
+    # saved memory traffic. Triton path retained as _w8a8_block_scaled_mm_sm86_triton
+    # for reference but not dispatched.
     try:
         from vllm.utils.deep_gemm import _use_sm86_reference
         if _use_sm86_reference():
@@ -1390,3 +1610,156 @@ def process_fp8_input_tensor_strategy_moe(
         )
 
     return w13_input_scale.max(), w2_input_scale.max()
+
+
+# ─── SM86 opaque-op wrappers for per_token_group_quant_fp8 ──────────────────
+# Inductor decomposes the eager-mode per_token_group_quant_fp8 into a fused
+# Triton kernel that uses tl.float8e4nv, which Triton refuses to compile on
+# SM<89. Wrapping as registered torch.library ops makes them opaque so the
+# fp8 cast lives outside any Inductor-traced region.
+try:
+    from vllm.utils.torch_utils import (
+        direct_register_custom_op as _dgq_direct_register_custom_op,
+    )
+
+    def _per_token_group_quant_fp8_sm86_op(
+        x: torch.Tensor,
+        group_size: int,
+        eps: float,
+        column_major_scales: bool,
+        tma_aligned_scales: bool,
+        use_ue8m0: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _per_token_group_quant_fp8_impl(
+            x,
+            group_size=group_size,
+            eps=eps,
+            dtype=current_platform.fp8_dtype(),
+            column_major_scales=column_major_scales,
+            tma_aligned_scales=tma_aligned_scales,
+            out_q=None,
+            use_ue8m0=use_ue8m0,
+        )
+
+    def _per_token_group_quant_fp8_sm86_op_fake(
+        x: torch.Tensor,
+        group_size: int,
+        eps: float,
+        column_major_scales: bool,
+        tma_aligned_scales: bool,
+        use_ue8m0: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        out = torch.empty_like(x, dtype=current_platform.fp8_dtype())
+        n_groups = x.shape[-1] // group_size
+        scale_shape = x.shape[:-1] + (n_groups,)
+        scales = torch.empty(scale_shape, dtype=torch.float32, device=x.device)
+        return out, scales
+
+    _dgq_direct_register_custom_op(
+        op_name="per_token_group_quant_fp8_sm86",
+        op_func=_per_token_group_quant_fp8_sm86_op,
+        mutates_args=[],
+        fake_impl=_per_token_group_quant_fp8_sm86_op_fake,
+    )
+
+    def _per_token_group_quant_fp8_packed_deepgemm_sm86_op(
+        x: torch.Tensor,
+        group_size: int,
+        eps: float,
+        use_ue8m0: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _per_token_group_quant_fp8_packed_for_deepgemm_impl(
+            x,
+            group_size=group_size,
+            eps=eps,
+            use_ue8m0=use_ue8m0,
+            out_q=None,
+        )
+
+    def _per_token_group_quant_fp8_packed_deepgemm_sm86_op_fake(
+        x: torch.Tensor,
+        group_size: int,
+        eps: float,
+        use_ue8m0: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        out = torch.empty_like(x, dtype=current_platform.fp8_dtype())
+        n_groups = x.shape[-1] // group_size
+        packed = (n_groups + 3) // 4
+        scale_shape = x.shape[:-1] + (packed,)
+        scales = torch.empty(scale_shape, dtype=torch.int32, device=x.device)
+        return out, scales
+
+    _dgq_direct_register_custom_op(
+        op_name="per_token_group_quant_fp8_packed_deepgemm_sm86",
+        op_func=_per_token_group_quant_fp8_packed_deepgemm_sm86_op,
+        mutates_args=[],
+        fake_impl=_per_token_group_quant_fp8_packed_deepgemm_sm86_op_fake,
+    )
+except Exception:
+    pass
+
+
+def _is_sm86_or_lower() -> bool:
+    try:
+        major, _ = torch.cuda.get_device_capability()
+        return major < 9
+    except Exception:
+        return False
+
+
+_DSV4_SM86: bool = _is_sm86_or_lower()
+
+
+def per_token_group_quant_fp8(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    dtype: torch.dtype | None = None,
+    column_major_scales: bool = False,
+    tma_aligned_scales: bool = False,
+    out_q: torch.Tensor | None = None,
+    use_ue8m0: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Public dispatcher: routes to opaque registered op on SM86, eager else."""
+    if (
+        _DSV4_SM86
+        and out_q is None
+        and (dtype is None or dtype == current_platform.fp8_dtype())
+        and hasattr(torch.ops.vllm, "per_token_group_quant_fp8_sm86")
+    ):
+        if use_ue8m0 is None:
+            use_ue8m0 = is_deep_gemm_e8m0_used()
+        return torch.ops.vllm.per_token_group_quant_fp8_sm86(
+            x, int(group_size), float(eps),
+            bool(column_major_scales), bool(tma_aligned_scales),
+            bool(use_ue8m0),
+        )
+    return _per_token_group_quant_fp8_impl(
+        x, group_size=group_size, eps=eps, dtype=dtype,
+        column_major_scales=column_major_scales,
+        tma_aligned_scales=tma_aligned_scales,
+        out_q=out_q, use_ue8m0=use_ue8m0,
+    )
+
+
+def per_token_group_quant_fp8_packed_for_deepgemm(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    use_ue8m0: bool | None = None,
+    out_q: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Public dispatcher: routes to opaque registered op on SM86, eager else."""
+    if (
+        _DSV4_SM86
+        and out_q is None
+        and hasattr(torch.ops.vllm, "per_token_group_quant_fp8_packed_deepgemm_sm86")
+    ):
+        if use_ue8m0 is None:
+            use_ue8m0 = is_deep_gemm_e8m0_used()
+        return torch.ops.vllm.per_token_group_quant_fp8_packed_deepgemm_sm86(
+            x, int(group_size), float(eps), bool(use_ue8m0),
+        )
+    return _per_token_group_quant_fp8_packed_for_deepgemm_impl(
+        x, group_size=group_size, eps=eps, use_ue8m0=use_ue8m0, out_q=out_q,
+    )

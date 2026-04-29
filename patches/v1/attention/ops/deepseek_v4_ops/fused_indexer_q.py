@@ -409,10 +409,11 @@ def fused_indexer_q_rope_quant(
                     "SM86 reference: MXFP4 indexer Q path not implemented. "
                     "Disable use_fp4_indexer_cache or run on SM>=90."
                 )
-            return _fused_indexer_q_rope_quant_pyref(
+            return torch.ops.vllm.deepseek_v4_fused_indexer_q_rope_quant_sm86(
                 positions, index_q, index_q_cos_sin_cache,
-                index_weights, index_weights_softmax_scale,
-                index_weights_head_scale,
+                index_weights,
+                float(index_weights_softmax_scale),
+                float(index_weights_head_scale),
             )
     except ImportError:
         pass
@@ -495,3 +496,180 @@ def fused_indexer_q_rope_quant(
         num_warps=1,  # TODO: Tune this
     )
     return index_q_fp8, index_weights_out
+
+
+# ─── SM86 Triton kernel: scaled-fp32 emit, no fp8 cast ─────────────────────
+@triton.jit
+def _fused_indexer_q_rope_scaled_fp32_emit_sm86(
+    pos_ptr,
+    index_q_ptr,
+    index_q_stride0,
+    index_q_stride1,
+    index_q_cos_sin_ptr,
+    index_q_cos_sin_stride,
+    INDEX_Q_HALF_ROT_DIM: tl.constexpr,
+    index_q_fp32_ptr,
+    index_q_fp32_stride0,
+    index_q_fp32_stride1,
+    INDEX_Q_HEAD_DIM: tl.constexpr,
+    index_weights_ptr,
+    index_weights_stride,
+    index_weights_softmax_scale,
+    index_weights_head_scale,
+    index_weights_out_ptr,
+    index_weights_out_stride,
+):
+    """SM86 variant of _fused_indexer_q_rope_quant_kernel.
+    Emits scaled fp32 values (clamped to ±448) into a fp32 buffer; the
+    caller does .to(torch.float8_e4m3fn) in eager Python."""
+    INDEX_Q_ROT_DIM: tl.constexpr = 2 * INDEX_Q_HALF_ROT_DIM
+    INDEX_Q_NOPE_DIM: tl.constexpr = INDEX_Q_HEAD_DIM - INDEX_Q_ROT_DIM
+    tl.static_assert(INDEX_Q_NOPE_DIM >= 0)
+
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    pos = tl.load(pos_ptr + tok_idx)
+    cos, sin = _get_cos_sin(
+        index_q_cos_sin_ptr,
+        index_q_cos_sin_stride,
+        pos,
+        INDEX_Q_HALF_ROT_DIM,
+    )
+    half_offset = tl.arange(0, INDEX_Q_HALF_ROT_DIM)
+    base_ptr = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
+
+    rot_base = base_ptr + INDEX_Q_NOPE_DIM
+    x_even = tl.load(rot_base + half_offset * 2).to(tl.float32)
+    x_odd = tl.load(rot_base + half_offset * 2 + 1).to(tl.float32)
+    r_even = x_even * cos - x_odd * sin
+    r_odd = x_odd * cos + x_even * sin
+
+    # Match reference numerics: fp32 → bf16 → fp32 before amax.
+    r_even = r_even.to(tl.bfloat16).to(tl.float32)
+    r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
+
+    amax = tl.maximum(tl.max(tl.abs(r_even)), tl.max(tl.abs(r_odd)))
+    if INDEX_Q_NOPE_DIM > 0:
+        nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
+        x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
+    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
+    index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+
+    fp32_base_ptr = (
+        index_q_fp32_ptr + tok_idx * index_q_fp32_stride0 + head_idx * index_q_fp32_stride1
+    )
+    if INDEX_Q_NOPE_DIM > 0:
+        # Scaled fp32 nope; clamp to fp8 range so .to(fp8) saturates correctly.
+        scaled_nope = tl.clamp(tl.div_rn(x_nope, index_q_scale), -448.0, 448.0)
+        tl.store(fp32_base_ptr + nope_offset, scaled_nope)
+    fp32_rot_base = fp32_base_ptr + INDEX_Q_NOPE_DIM
+    scaled_even = tl.clamp(tl.div_rn(r_even, index_q_scale), -448.0, 448.0)
+    scaled_odd = tl.clamp(tl.div_rn(r_odd, index_q_scale), -448.0, 448.0)
+    tl.store(fp32_rot_base + half_offset * 2, scaled_even)
+    tl.store(fp32_rot_base + half_offset * 2 + 1, scaled_odd)
+
+    index_weights = tl.load(
+        index_weights_ptr + tok_idx * index_weights_stride + head_idx
+    )
+    index_weights = index_weights.to(tl.float32)
+    index_weights *= index_q_scale
+    index_weights *= index_weights_softmax_scale
+    index_weights *= index_weights_head_scale
+    tl.store(
+        index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
+        index_weights,
+    )
+
+
+def _fused_indexer_q_rope_quant_sm86_triton(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SM86 path: Triton emits scaled fp32; eager casts to fp8."""
+    num_tokens = positions.shape[0]
+    num_index_q_heads = index_q.shape[1]
+    index_q_head_dim = index_q.shape[2]
+
+    index_q_fp32 = torch.empty(
+        (num_tokens, num_index_q_heads, index_q_head_dim),
+        dtype=torch.float32,
+        device=index_q.device,
+    )
+    index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+
+    _fused_indexer_q_rope_scaled_fp32_emit_sm86[(num_tokens, num_index_q_heads)](
+        positions,
+        index_q,
+        index_q.stride(0),
+        index_q.stride(1),
+        index_q_cos_sin_cache,
+        index_q_cos_sin_cache.stride(0),
+        index_q_cos_sin_cache.shape[-1] // 2,
+        index_q_fp32,
+        index_q_fp32.stride(0),
+        index_q_fp32.stride(1),
+        index_q_head_dim,
+        index_weights,
+        index_weights.stride(0),
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        index_weights_out,
+        index_weights_out.stride(0),
+        num_warps=1,
+    )
+
+    index_q_fp8 = index_q_fp32.to(torch.float8_e4m3fn)
+    return index_q_fp8, index_weights_out
+
+
+# ─── SM86 opaque-op wrapper ────────────────────────────────────────────────
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op as _diq_register
+
+    def _fused_indexer_q_rope_quant_sm86_op(
+        positions: torch.Tensor,
+        index_q: torch.Tensor,
+        index_q_cos_sin_cache: torch.Tensor,
+        index_weights: torch.Tensor,
+        index_weights_softmax_scale: float,
+        index_weights_head_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            return _fused_indexer_q_rope_quant_sm86_triton(
+                positions, index_q, index_q_cos_sin_cache,
+                index_weights, index_weights_softmax_scale,
+                index_weights_head_scale,
+            )
+        except Exception:
+            return _fused_indexer_q_rope_quant_pyref(
+                positions, index_q, index_q_cos_sin_cache,
+                index_weights, index_weights_softmax_scale,
+                index_weights_head_scale,
+            )
+
+    def _fused_indexer_q_rope_quant_sm86_op_fake(
+        positions: torch.Tensor,
+        index_q: torch.Tensor,
+        index_q_cos_sin_cache: torch.Tensor,
+        index_weights: torch.Tensor,
+        index_weights_softmax_scale: float,
+        index_weights_head_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_quant = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
+        weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+        return q_quant, weights_out
+
+    _diq_register(
+        op_name="deepseek_v4_fused_indexer_q_rope_quant_sm86",
+        op_func=_fused_indexer_q_rope_quant_sm86_op,
+        mutates_args=[],
+        fake_impl=_fused_indexer_q_rope_quant_sm86_op_fake,
+    )
+except Exception:
+    pass

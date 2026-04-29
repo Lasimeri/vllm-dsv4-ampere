@@ -3,9 +3,159 @@ import dataclasses
 import os
 
 import torch
+import triton
+import triton.language as tl
 
 import vllm._flashmla_C
 flash_mla_cuda = torch.ops._flashmla_C
+
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _fp8_e4m3fn_byte_to_bf16,
+)
+
+
+@triton.jit
+def _dequant_fp8_kv_slot_kernel(
+    cache_ptr,            # uint8 paged cache [num_blocks, block_stride] flat
+    slot_indices_ptr,     # int64 [N] (caller pre-converted to int64 with mask handling)
+    out_ptr,              # bf16 [N, 512]
+    valid_mask_ptr,       # bool [N]
+    N,
+    block_size: tl.constexpr,
+    block_stride: tl.constexpr,
+    max_slot: tl.constexpr,
+    NOPE_DIM: tl.constexpr,         # 448
+    BF16_DIM: tl.constexpr,         # 64
+    QUANT_BLOCK: tl.constexpr,      # 64
+    N_NOPE_BLOCKS: tl.constexpr,    # 7
+    TOKEN_DATA_SIZE: tl.constexpr,  # 576
+    TOKEN_SCALE_DIM: tl.constexpr,  # 8
+    OUT_DIM: tl.constexpr,          # 512
+):
+    """One program per K slot. Reads paged-cache bytes for the slot,
+    dequants 448 fp8 to bf16 via byte-unpack + UE8M0 scale, concatenates
+    the 64 bf16 stored portion, writes [512] bf16 row. Zeros invalid slots."""
+    n_idx = tl.program_id(0)
+    if n_idx >= N:
+        return
+
+    slot = tl.load(slot_indices_ptr + n_idx)
+    is_valid = (slot >= 0) & (slot < max_slot)
+
+    safe_slot = tl.where(is_valid, slot, 0)
+    block_idx = safe_slot // block_size
+    pos_in_block = safe_slot % block_size
+
+    cache_block_base = block_idx.to(tl.int64) * block_stride
+    data_base = cache_block_base + pos_in_block * TOKEN_DATA_SIZE
+    scale_base = (
+        cache_block_base
+        + block_size * TOKEN_DATA_SIZE
+        + pos_in_block * TOKEN_SCALE_DIM
+    )
+
+    # Load 8 scale bytes (7 real + 1 pad). Pad byte unused; scaling
+    # below applies only to first 7 groups since NOPE has 7×64 dims.
+    scale_offsets = tl.arange(0, 8)
+    scale_bytes = tl.load(cache_ptr + scale_base + scale_offsets)
+
+    # Convert UE8M0 byte → fp32 scale = 2^(byte-127).
+    scales_f32_8 = tl.exp2(scale_bytes.to(tl.float32) - 127.0)
+
+    # Output buffer for this row, fp32 then cast to bf16 at end.
+    # NOPE_DIM = 7 * 64 = 448; pad to 8*64 = 512 with zero scaling.
+    PADDED_NOPE: tl.constexpr = 8 * QUANT_BLOCK
+    nope_offsets = tl.arange(0, PADDED_NOPE)
+    nope_mask = nope_offsets < NOPE_DIM
+    fp8_bytes = tl.load(cache_ptr + data_base + nope_offsets, mask=nope_mask, other=0)
+    nope_bf16 = _fp8_e4m3fn_byte_to_bf16(fp8_bytes).to(tl.float32)
+
+    # Apply per-block scale: reshape to [8, QUANT_BLOCK]; pad-block scale
+    # is unused (zeroed via nope_mask anyway).
+    nope_2d = tl.reshape(nope_bf16, (8, QUANT_BLOCK))
+    scales_2d = tl.reshape(scales_f32_8, (8, 1))
+    nope_scaled = nope_2d * scales_2d
+    nope_padded_flat = tl.reshape(nope_scaled, (PADDED_NOPE,))
+
+    # Load 64 bf16 values from offset NOPE_DIM (128 bytes = 64 bf16).
+    bf16_offsets = tl.arange(0, BF16_DIM)
+    bf16_byte_offsets = NOPE_DIM + bf16_offsets * 2  # 2 bytes per bf16
+    # Load as i16 then bitcast.
+    bf16_lo = tl.load(cache_ptr + data_base + bf16_byte_offsets).to(tl.int32)
+    bf16_hi = tl.load(cache_ptr + data_base + bf16_byte_offsets + 1).to(tl.int32)
+    bf16_bits = (bf16_hi << 8) | bf16_lo
+    bf16_bits_i16 = bf16_bits.to(tl.int16)
+    bf16_vals = bf16_bits_i16.to(tl.bfloat16, bitcast=True).to(tl.float32)
+
+    # Apply valid mask (zero out invalid slots).
+    valid_f = is_valid.to(tl.float32)
+    nope_padded_flat = nope_padded_flat * valid_f
+    bf16_vals = bf16_vals * valid_f
+
+    # Write output: [NOPE_DIM] then [BF16_DIM] = 512 total. Padded rows
+    # past NOPE_DIM are masked.
+    out_row = out_ptr + n_idx * OUT_DIM
+    tl.store(out_row + nope_offsets, nope_padded_flat.to(tl.bfloat16), mask=nope_mask)
+    tl.store(out_row + NOPE_DIM + bf16_offsets, bf16_vals.to(tl.bfloat16))
+
+    # Write valid mask.
+    tl.store(valid_mask_ptr + n_idx, is_valid)
+
+
+def _dequant_fp8_kv_slots_sm86_triton(
+    cache: torch.Tensor,
+    slot_indices: torch.Tensor,
+    head_dim_v: int = 512,
+    head_dim_rope: int = 64,
+    num_groups: int = 4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SM_86 Triton fast path for _dequant_fp8_kv_slots.
+    Same contract as the pyref; assumes V4 packed cache layout."""
+    NOPE_DIM = 448
+    BF16_DIM = 64
+    QUANT_BLOCK = 64
+    N_NOPE_BLOCKS = NOPE_DIM // QUANT_BLOCK
+    TOKEN_DATA_SIZE = NOPE_DIM + BF16_DIM * 2
+    TOKEN_SCALE_DIM = 8
+    OUT_DIM = NOPE_DIM + BF16_DIM
+
+    num_blocks, block_size, num_kv_heads, head_bytes = cache.shape
+    max_slot = num_blocks * block_size
+
+    # CRITICAL: cache may have padding between blocks (alignment). Use the
+    # actual memory stride between blocks, not the logical content size.
+    # Per-byte address: cache_data + block_idx * cache.stride(0) + ...
+    block_stride = cache.stride(0)
+
+    slot_indices = slot_indices.contiguous().to(torch.int64)
+    N = slot_indices.shape[0]
+    if N == 0:
+        out = torch.zeros((0, OUT_DIM), dtype=torch.bfloat16, device=cache.device)
+        valid_mask = torch.zeros((0,), dtype=torch.bool, device=cache.device)
+        return out, valid_mask
+
+    out = torch.empty((N, OUT_DIM), dtype=torch.bfloat16, device=cache.device)
+    valid_mask = torch.empty((N,), dtype=torch.bool, device=cache.device)
+
+    _dequant_fp8_kv_slot_kernel[(N,)](
+        cache,                            # pass original (kernel walks via raw byte offsets)
+        slot_indices,
+        out,
+        valid_mask,
+        N,
+        block_size=block_size,
+        block_stride=block_stride,
+        max_slot=max_slot,
+        NOPE_DIM=NOPE_DIM,
+        BF16_DIM=BF16_DIM,
+        QUANT_BLOCK=QUANT_BLOCK,
+        N_NOPE_BLOCKS=N_NOPE_BLOCKS,
+        TOKEN_DATA_SIZE=TOKEN_DATA_SIZE,
+        TOKEN_SCALE_DIM=TOKEN_SCALE_DIM,
+        OUT_DIM=OUT_DIM,
+        num_warps=4,
+    )
+    return out, valid_mask
 
 
 def _flashmla_use_sm86_reference() -> bool:
@@ -150,9 +300,14 @@ def _flash_mla_decode_pyref(
                 else swa_idx.shape[0]
             )
             swa_idx_v = swa_idx[:swa_len]
-            k_swa, mask_swa = _dequant_fp8_kv_slots(
-                k_cache, swa_idx_v, head_dim_v, head_dim_rope
-            )
+            try:
+                k_swa, mask_swa = _dequant_fp8_kv_slots_sm86_triton(
+                    k_cache, swa_idx_v, head_dim_v, head_dim_rope
+                )
+            except Exception:
+                k_swa, mask_swa = _dequant_fp8_kv_slots(
+                    k_cache, swa_idx_v, head_dim_v, head_dim_rope
+                )
 
             if extra_k_cache is not None and extra_indices_in_kvcache is not None:
                 ex_idx = (
@@ -166,9 +321,14 @@ def _flash_mla_decode_pyref(
                     else ex_idx.shape[0]
                 )
                 ex_idx_v = ex_idx[:ex_len]
-                k_ex, mask_ex = _dequant_fp8_kv_slots(
-                    extra_k_cache, ex_idx_v, head_dim_v, head_dim_rope
-                )
+                try:
+                    k_ex, mask_ex = _dequant_fp8_kv_slots_sm86_triton(
+                        extra_k_cache, ex_idx_v, head_dim_v, head_dim_rope
+                    )
+                except Exception:
+                    k_ex, mask_ex = _dequant_fp8_kv_slots(
+                        extra_k_cache, ex_idx_v, head_dim_v, head_dim_rope
+                    )
                 K = torch.cat([k_swa, k_ex], dim=0)
                 mask = torch.cat([mask_swa, mask_ex], dim=0)
             else:

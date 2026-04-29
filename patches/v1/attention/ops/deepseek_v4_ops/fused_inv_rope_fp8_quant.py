@@ -196,24 +196,10 @@ def _fused_inv_rope_fp8_quant_pyref(
     quant = torch.clamp(o_blocks / scales_exp, -fp8_max, fp8_max)
     fp8_vals = quant.reshape(T, G, d).to(fp8_dtype)
 
-    tma_T = get_tma_aligned_size(T, 4)
-    fp8_buf = torch.empty(
-        (G, tma_T, d), dtype=fp8_dtype, device=o.device
-    )
-    fp8_buf[:, :T] = fp8_vals.permute(1, 0, 2)
-    if tma_T > T:
-        fp8_buf[:, T:].zero_()
-    out_fp8 = fp8_buf[:, :T].transpose(0, 1).contiguous()
+    out_fp8 = fp8_vals.contiguous()
 
     if tma_aligned_scales:
         packed_k = (chunks + 3) // 4
-        scale_storage = torch.zeros(
-            G * packed_k * tma_T, dtype=torch.int32, device=o.device
-        )
-        scale_buf = scale_storage.as_strided(
-            (G, T, packed_k),
-            (packed_k * tma_T, 1, tma_T),
-        )
         scale_bits = scales.view(torch.int32)
         ue8m0 = (scale_bits >> 23) & 0xFF
         if chunks % 4 != 0:
@@ -224,19 +210,10 @@ def _fused_inv_rope_fp8_quant_pyref(
             )
         ue8m0_grp = ue8m0.reshape(T, G, packed_k, 4)
         shifts = torch.tensor([0, 8, 16, 24], device=o.device, dtype=torch.int32)
-        packed = (ue8m0_grp * (1 << shifts)).sum(dim=-1)
-        scale_buf.copy_(packed.permute(1, 0, 2))
+        out_scale = (ue8m0_grp * (1 << shifts)).sum(dim=-1).contiguous()
     else:
-        scale_storage = torch.zeros(
-            G * chunks * tma_T, dtype=torch.float32, device=o.device
-        )
-        scale_buf = scale_storage.as_strided(
-            (G, T, chunks),
-            (chunks * tma_T, 1, tma_T),
-        )
-        scale_buf.copy_(scales.permute(1, 0, 2))
+        out_scale = scales.contiguous()
 
-    out_scale = scale_buf.transpose(0, 1)
     return out_fp8, out_scale
 
 
@@ -272,11 +249,11 @@ def fused_inv_rope_fp8_quant(
     try:
         from vllm.utils.deep_gemm import _use_sm86_reference
         if _use_sm86_reference():
-            return _fused_inv_rope_fp8_quant_pyref(
+            return torch.ops.vllm.deepseek_v4_fused_inv_rope_fp8_quant_sm86(
                 o, positions, cos_sin_cache,
-                n_groups, heads_per_group,
-                nope_dim, rope_dim, quant_group_size,
-                tma_aligned_scales,
+                int(n_groups), int(heads_per_group),
+                int(nope_dim), int(rope_dim), int(quant_group_size),
+                bool(tma_aligned_scales),
             )
     except Exception:
         pass
@@ -359,3 +336,248 @@ def fused_inv_rope_fp8_quant(
     )
 
     return fp8_buf.transpose(0, 1), scale_buf.transpose(0, 1)
+
+
+# ─── SM86 Triton kernel: emits scaled fp32 (no fp8 cast in kernel) ─────────
+@triton.jit
+def _fused_inv_rope_scaled_fp32_emit_sm86(
+    o_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    fp32_ptr,
+    scale_ptr,
+    num_tokens,
+    heads_per_group: tl.constexpr,
+    o_stride_token,
+    o_stride_head,
+    cache_stride_pos,
+    fp32_stride_group,
+    fp32_stride_token,
+    scale_stride_group,
+    scale_stride_token,
+    scale_stride_k,
+    fp8_max: tl.constexpr,
+    eps: tl.constexpr,
+    QUANT_GROUP_SIZE: tl.constexpr,
+    CHUNKS_PER_HEAD: tl.constexpr,
+    ROPE_START: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+):
+    """SM86 variant of _fused_inv_rope_fp8_quant_per_head.
+    Identical math, but emits scaled fp32 values (clamped to ±fp8_max) and
+    fp32 scales. The caller converts the fp32 buffer to fp8_e4m3fn via
+    PyTorch's .to(torch.float8_e4m3fn) which works on SM<89."""
+    pid_token = tl.program_id(0).to(tl.int64)
+    pid_gh = tl.program_id(1).to(tl.int64)
+
+    g = pid_gh // heads_per_group
+    head_in_group = pid_gh % heads_per_group
+    global_head = pid_gh
+    qb_start = head_in_group * CHUNKS_PER_HEAD
+
+    if pid_token >= num_tokens:
+        return
+
+    input_base = o_ptr + pid_token * o_stride_token + global_head * o_stride_head
+
+    HEAD_DIM: tl.constexpr = CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
+    offsets = tl.arange(0, HEAD_DIM)
+    x = tl.load(input_base + offsets).to(tl.float32)
+
+    rope_abs_start: tl.constexpr = (CHUNKS_PER_HEAD - 1) * QUANT_GROUP_SIZE + ROPE_START
+    pos = tl.load(positions_ptr + pid_token)
+    cache_base = cos_sin_cache_ptr + pos * cache_stride_pos
+    is_rope = offsets >= rope_abs_start
+    rope_local = offsets - rope_abs_start
+
+    x_partner = tl.load(input_base + (offsets ^ 1), mask=is_rope, other=0.0).to(
+        tl.float32
+    )
+    cs_idx = tl.maximum(rope_local >> 1, 0)
+    cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
+    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
+    x_add = x * cos_v + x_partner * sin_v
+    x_sub = x * cos_v - x_partner * sin_v
+    is_even = (rope_local & 1) == 0
+    rotated = tl.where(is_even, x_add, x_sub)
+    x = tl.where(is_rope, rotated, x)
+
+    x_2d = tl.reshape(tl.abs(x), (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE))
+    block_absmax = tl.maximum(tl.max(x_2d, axis=1), eps)
+    scale_raw = block_absmax * (1.0 / fp8_max)
+    scales = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
+
+    scales_exp = tl.reshape(
+        tl.broadcast_to(
+            tl.reshape(scales, (CHUNKS_PER_HEAD, 1)),
+            (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE),
+        ),
+        (HEAD_DIM,),
+    )
+    # Emit scaled fp32 (clamped to fp8 range); caller does .to(fp8) cast.
+    x_scaled = tl.clamp(x / scales_exp, -fp8_max, fp8_max)
+
+    fp32_base = (
+        fp32_ptr
+        + g * fp32_stride_group
+        + pid_token * fp32_stride_token
+        + qb_start * QUANT_GROUP_SIZE
+    )
+    tl.store(fp32_base + offsets, x_scaled)
+
+    block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
+    qb_indices = qb_start + block_offsets
+    scale_addrs = (
+        scale_ptr
+        + g * scale_stride_group
+        + pid_token * scale_stride_token
+        + qb_indices * scale_stride_k
+    )
+    tl.store(scale_addrs, scales)
+
+
+def _fused_inv_rope_fp8_quant_sm86_triton(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    quant_group_size: int,
+    tma_aligned_scales: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SM86 path: Triton kernel emits scaled fp32; PyTorch does .to(fp8).
+    Output contract identical to the SM>=89 path: returns (fp8 [T,G,d],
+    scale [T,G,chunks]). Ignores tma_aligned_scales (no TMA on SM86)."""
+    num_tokens, num_heads, head_dim = o.shape
+    assert num_heads == n_groups * heads_per_group
+    assert head_dim == nope_dim + rope_dim
+    assert head_dim % quant_group_size == 0
+    assert nope_dim % quant_group_size == (quant_group_size - rope_dim)
+    assert rope_dim % 2 == 0
+    assert cos_sin_cache.shape[-1] == rope_dim
+    assert cos_sin_cache.dtype == torch.float32
+
+    d = heads_per_group * head_dim
+    num_scale_blocks = d // quant_group_size
+    chunks_per_head = head_dim // quant_group_size
+
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+
+    # Triton kernel writes fp32 here; we cast to fp8 below.
+    fp32_buf = torch.empty(
+        (n_groups, num_tokens, d),
+        dtype=torch.float32,
+        device=o.device,
+    )
+    # No TMA padding on SM86; contiguous layout.
+    scale_buf = torch.empty(
+        (n_groups, num_tokens, num_scale_blocks),
+        dtype=torch.float32,
+        device=o.device,
+    )
+
+    grid = (num_tokens, n_groups * heads_per_group)
+    _fused_inv_rope_scaled_fp32_emit_sm86[grid](
+        o,
+        positions,
+        cos_sin_cache,
+        fp32_buf,
+        scale_buf,
+        num_tokens,
+        heads_per_group=heads_per_group,
+        o_stride_token=o.stride(0),
+        o_stride_head=o.stride(1),
+        cache_stride_pos=cos_sin_cache.stride(0),
+        fp32_stride_group=fp32_buf.stride(0),
+        fp32_stride_token=fp32_buf.stride(1),
+        scale_stride_group=scale_buf.stride(0),
+        scale_stride_token=scale_buf.stride(1),
+        scale_stride_k=scale_buf.stride(2),
+        fp8_max=fp8_max,
+        eps=1e-10,
+        QUANT_GROUP_SIZE=quant_group_size,
+        CHUNKS_PER_HEAD=chunks_per_head,
+        ROPE_START=nope_dim % quant_group_size,
+        HALF_ROPE=rope_dim // 2,
+        num_warps=1,
+    )
+
+    # Cast fp32 → fp8 in eager (works on SM86, ~1 kernel launch).
+    out_fp8 = fp32_buf.to(fp8_dtype).transpose(0, 1).contiguous()
+    out_scale = scale_buf.transpose(0, 1).contiguous()
+    return out_fp8, out_scale
+
+
+# ─── SM86 opaque-op wrapper ────────────────────────────────────────────────
+# Wrap the SM86 pyref as a registered torch.library op so the .to(fp8e4nv)
+# inside is hidden from Inductor (which otherwise codegens a Triton kernel
+# that fails to compile on SM<89).
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    def _fused_inv_rope_fp8_quant_sm86_op(
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        n_groups: int,
+        heads_per_group: int,
+        nope_dim: int,
+        rope_dim: int,
+        quant_group_size: int,
+        tma_aligned_scales: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Triton kernel path; falls back to pyref on failure.
+        try:
+            return _fused_inv_rope_fp8_quant_sm86_triton(
+                o, positions, cos_sin_cache,
+                n_groups, heads_per_group,
+                nope_dim, rope_dim, quant_group_size,
+                tma_aligned_scales,
+            )
+        except Exception:
+            return _fused_inv_rope_fp8_quant_pyref(
+                o, positions, cos_sin_cache,
+                n_groups, heads_per_group,
+                nope_dim, rope_dim, quant_group_size,
+                tma_aligned_scales,
+            )
+
+    def _fused_inv_rope_fp8_quant_sm86_op_fake(
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        n_groups: int,
+        heads_per_group: int,
+        nope_dim: int,
+        rope_dim: int,
+        quant_group_size: int,
+        tma_aligned_scales: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        T, H, D = o.shape
+        d = heads_per_group * D
+        chunks = d // quant_group_size
+        out_fp8 = torch.empty(
+            (T, n_groups, d), dtype=torch.float8_e4m3fn, device=o.device,
+        )
+        if tma_aligned_scales:
+            packed_k = (chunks + 3) // 4
+            out_scale = torch.empty(
+                (T, n_groups, packed_k), dtype=torch.int32, device=o.device,
+            )
+        else:
+            out_scale = torch.empty(
+                (T, n_groups, chunks), dtype=torch.float32, device=o.device,
+            )
+        return out_fp8, out_scale
+
+    direct_register_custom_op(
+        op_name="deepseek_v4_fused_inv_rope_fp8_quant_sm86",
+        op_func=_fused_inv_rope_fp8_quant_sm86_op,
+        mutates_args=[],
+        fake_impl=_fused_inv_rope_fp8_quant_sm86_op_fake,
+    )
+except Exception:
+    pass

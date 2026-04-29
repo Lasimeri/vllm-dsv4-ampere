@@ -24,6 +24,10 @@ export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1
 # Disable TF32 at the driver level for IEEE-correct FP32 residual math
 # (norms, softmax fallbacks). Matmul still runs in BF16/FP8/FP4 per dtype.
 export NVIDIA_TF32_OVERRIDE=0
+# Force Marlin for MXFP4 MoE. On SM86 this is the only backend that supports
+# kMxfp4Static (DeepGEMM FP4 needs SM100+, TRTLLM needs SM90+). Marlin SASS
+# fallback target on SM86 is sm_80 (no sm_86 cubin in _moe_C.abi3.so).
+export VLLM_MXFP4_USE_MARLIN=1
 
 MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
 [ -d "/llms/archive/deepseek-v4-flash" ] && MODEL_PATH="/llms/archive/deepseek-v4-flash"
