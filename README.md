@@ -6,7 +6,13 @@ Status: **working with PIECEWISE cudagraph capture**. Generates coherent text, f
 
 This is a starting point for the community. Upstream vLLM rejects FP8/sparse-MLA/DeepGEMM support on SM<90 ("SM80 support better lives in a fork", per @youkaichao on PR #40906). This repo replaces every blocking kernel with either a pure-PyTorch reference path or a hand-written SM86 Triton kernel that engages BF16 tensor cores.
 
-> **Note on the vLLM base commit:** the repo above pins `0.1.dev15830+g8d599d76a` (commit `8d599d76a`) which was an intermediate hash on the upstream PR #40860 ("DeepSeek V4 Rebased") staging tree. That commit was squash-merged into vllm-project/vllm `main` on 2026-04-27 and the original hash garbage-collected, so it no longer resolves on github.com/vllm-project/vllm. **Functionally equivalent state**: any vllm-project/vllm `main` checkout from 2026-04-27 onwards (or the v0.20.x patch line) is structurally compatible. Apply the patches in `patches/` on top.
+> **Note on the vLLM base commit:** the repo above pins `0.1.dev15830+g8d599d76a` (commit `8d599d76a`) which was an intermediate hash on the upstream PR #40860 ("DeepSeek V4 Rebased") staging tree. That commit was squash-merged into vllm-project/vllm `main` on 2026-04-27 and the original hash garbage-collected, so it no longer resolves on github.com/vllm-project/vllm.
+>
+> **Tested base versions:**
+> - `0.1.dev15830+g8d599d76a` (the original capture): full E2E run at 2.58 tok/s PIECEWISE.
+> - `vllm==0.20.1` (PyPI release, tested 2026-05-07): patches apply cleanly and all four `torch.ops.vllm.*` ops referenced by `deepseek_v4` (`hc_head_fused_kernel`, `mhc_pre`, `mhc_post`, `deepseek_v4_mega_moe_experts`) register at import time. **Op-registration parity only; full DSv4-Flash inference on 0.20.1 is not yet validated and may surface additional refactor-induced incompatibilities.** See issue #3 for the original failure mode (fixed by commit on the `compat/vllm-0.20.1` branch).
+>
+> Other `vllm-project/vllm` `main` commits from 2026-04-27 onwards may apply but are unverified. Apply the patches in `patches/` on top.
 
 ## What this is not
 
