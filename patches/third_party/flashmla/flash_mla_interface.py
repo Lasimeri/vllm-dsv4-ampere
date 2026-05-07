@@ -13,6 +13,11 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _fp8_e4m3fn_byte_to_bf16,
 )
 
+from vllm.third_party.flashmla.flash_mla_decode_sm86 import (
+    _flash_mla_decode_sm86_triton,
+    _k11_enabled,
+)
+
 
 @triton.jit
 def _dequant_fp8_kv_slot_kernel(
@@ -564,6 +569,22 @@ def flash_mla_with_kvcache(
                 q.shape[0], q.shape[1], q.shape[2], head_dim_v,
                 dtype=q.dtype, device=q.device,
             )
+        # K11 fast path: fused Triton decode kernel. Decode-only (S_q == 1).
+        if _k11_enabled() and q.shape[1] == 1 and head_dim_v == 512:
+            try:
+                return _flash_mla_decode_sm86_triton(
+                    q=q, k_cache=k_cache, head_dim_v=head_dim_v,
+                    indices=indices_in_kvcache, topk_length=topk_length,
+                    attn_sink=attn_sink, softmax_scale=softmax_scale,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices_in_kvcache,
+                    extra_topk_length=extra_topk_length, out=out,
+                )
+            except Exception as _k11_e:
+                if os.environ.get("VLLM_SM86_K11_DEBUG"):
+                    import traceback
+                    print(f"[k11] fell back to pyref: {_k11_e!r}")
+                    traceback.print_exc()
         return _flash_mla_decode_pyref(
             q=q, k_cache=k_cache, head_dim_v=head_dim_v,
             indices=indices_in_kvcache, topk_length=topk_length,

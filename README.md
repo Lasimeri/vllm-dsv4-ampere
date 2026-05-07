@@ -2,9 +2,11 @@
 
 Patches that let **DeepSeek-V4-Flash** run on **Ampere SM 8.6** GPUs (RTX 30xx) under vLLM.
 
-Status: **working with PIECEWISE cudagraph capture**. Generates coherent text, follows instructions, emits valid OpenAI-compatible tool calls. **~2.58 tok/s** sustained decode at short context on 8x RTX 3080 20GB (vLLM 0.1.dev15830+g8d599d76a, PIECEWISE compile + capture). Eager-mode fallback runs at ~2.01 tok/s.
+Status: **working with PIECEWISE cudagraph capture**. Generates coherent text, follows instructions, emits valid OpenAI-compatible tool calls. **~2.6 tok/s** sustained decode at short context on 8x RTX 3080 20GB (vLLM 0.1.dev15830+g8d599d76a, PIECEWISE compile + capture). Eager-mode fallback runs at ~2.01 tok/s.
 
 This is a starting point for the community. Upstream vLLM rejects FP8/sparse-MLA/DeepGEMM support on SM<90 ("SM80 support better lives in a fork", per @youkaichao on PR #40906). This repo replaces every blocking kernel with either a pure-PyTorch reference path or a hand-written SM86 Triton kernel that engages BF16 tensor cores.
+
+> **Note on the vLLM base commit:** the repo above pins `0.1.dev15830+g8d599d76a` (commit `8d599d76a`) which was an intermediate hash on the upstream PR #40860 ("DeepSeek V4 Rebased") staging tree. That commit was squash-merged into vllm-project/vllm `main` on 2026-04-27 and the original hash garbage-collected, so it no longer resolves on github.com/vllm-project/vllm. **Functionally equivalent state**: any vllm-project/vllm `main` checkout from 2026-04-27 onwards (or the v0.20.x patch line) is structurally compatible. Apply the patches in `patches/` on top.
 
 ## What this is not
 
@@ -27,28 +29,41 @@ Other Ampere cards should work as long as the aggregate VRAM is enough for the 1
 ## Install
 
 ```bash
-# 1. Install vllm at the matching version
-#    pip install vllm==0.1.dev15830+g8d599d76a   (or compatible nightly)
+# 1. Install vllm-project/vllm at any main-branch commit from
+#    2026-04-27 onwards (after PR #40860 "DeepSeek V4 Rebased" merged).
+#    Building from source is recommended since the dev wheel for the
+#    exact base commit is no longer on PyPI.
+#      git clone https://github.com/vllm-project/vllm
+#      cd vllm && git checkout <main-after-2026-04-27>
+#      pip install -e . --no-build-isolation
+#    A v0.20.x patch-line release works equivalently.
 
-# 2. Apply patches
+# 2. Apply patches (overlays the SM86 pyref + Triton replacements)
+git clone https://github.com/Lasimeri/vllm-dsv4-ampere
+cd vllm-dsv4-ampere
 ./install.sh /path/to/your/vllm-env/lib/python3.X/site-packages/vllm
 
-# 3. Edit wrapper-vllm-deepseek.sh: set MODEL_PATH and the vllm bin path
-#    for your setup, then run it.
+# 3. Edit wrapper-vllm-deepseek.sh: set VLLM_BIN (or activate the
+#    venv) and MODEL_PATH for your setup, then run it.
+cp wrapper-vllm-deepseek.sh ~/bin/vllm-deepseek
+chmod +x ~/bin/vllm-deepseek
+~/bin/vllm-deepseek
 ```
 
 The pyref paths auto-activate when `torch.cuda.get_device_capability() < (9, 0)`. On Hopper+ they are inert no-ops.
 
-Override:
-- `VLLM_SM86_DEEPSEEK_V4_REF=1` -- force enable
-- `VLLM_SM86_DEEPSEEK_V4_REF=0` -- force disable
+### Env-var overrides
 
-Required envvar on SM86:
-- `VLLM_MXFP4_USE_MARLIN=1` -- Marlin is the only MoE backend that supports `kMxfp4Static` below SM90 (DeepGEMM FP4 needs SM100+, TRTLLM needs SM90+). Wrapper sets this automatically.
+| Var | Default | Effect |
+| --- | --- | --- |
+| `VLLM_SM86_DEEPSEEK_V4_REF` | auto | `1` force enable on Hopper+ (testing); `0` force disable on Ampere |
+| `VLLM_SM86_K11` | `0` | `1` enable experimental fused FlashMLA decode kernel (correct, single-program grid loses to cuBLAS at decode shape -- left disabled for split-K rework) |
+| `VLLM_SM86_K12` | `0` | `1` enable experimental fused paged-MQA logits kernel (3.6x kernel-isolated, but bf16 reduction-order noise vs cuBLAS shifts sparse top-K and breaks MTP draft acceptance; default off) |
+| `VLLM_MXFP4_USE_MARLIN` | required `1` | Wrapper sets this. Marlin is the only MoE backend that supports `kMxfp4Static` below SM90 (DeepGEMM FP4 needs SM100+, TRTLLM needs SM90+) |
 
 ## What's patched
 
-12 vLLM Python files total. Categories:
+14 vLLM Python files total (12 modified upstream files + 2 new SM86-only files). Categories:
 
 ```
 [ Compute kernels (DeepGEMM-replaced) ]
@@ -74,8 +89,15 @@ Required envvar on SM86:
 
 [ FlashMLA C++ replacements ]
   third_party/flashmla/flash_mla_interface.py
-    flash_mla_with_kvcache (sparse decode pyref + K10 Triton dequant)
+    flash_mla_with_kvcache (sparse decode pyref + K10 Triton dequant
+                            + optional K11 fused decode dispatch)
     flash_mla_sparse_fwd   (sparse prefill pyref)
+  third_party/flashmla/flash_mla_decode_sm86.py    [NEW, SM86-only]
+    K11 fused FlashMLA decode -- experimental, default off
+
+[ Standalone SM86 kernels ]
+  utils/fp8_paged_mqa_logits_sm86.py               [NEW, SM86-only]
+    K12 fused paged-MQA logits -- experimental, default off
 
 [ Triton dtype workarounds ]
   model_executor/layers/quantization/utils/fp8_utils.py
@@ -97,21 +119,25 @@ See `MANIFEST.md` for the full per-file changelog including version-to-version d
 
 ## Hand-tuned SM86 Triton kernels
 
-Three kernels were written by hand for SM86 (no native fp8e4nv, no TMA, no FP4) following haosdent's pattern from PR #40906 (Triton emits scaled fp32, eager casts to fp8 outside the compile region):
+Five kernels written by hand for SM86 (no native fp8e4nv, no TMA, no FP4). The shipped three follow haosdent's pattern from PR #40906 (Triton emits scaled fp32, eager casts to fp8 outside the compile region):
 
-- **K6** -- inv-RoPE + fp8 quant -- 4.36x kernel-isolated
-  `v1/attention/ops/deepseek_v4_ops/fused_inv_rope_fp8_quant.py`
-- **K7** -- indexer-Q RoPE + fp8 quant -- 7.38x kernel-isolated
-  `v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py`
-- **K10-dequant** -- fp8 K-cache dequant inner kernel -- 7.01x kernel-isolated
-  `third_party/flashmla/flash_mla_interface.py`
+| Kernel | Path | Status | Speedup |
+| --- | --- | --- | --- |
+| **K6** -- inv-RoPE + fp8 quant | `v1/attention/ops/deepseek_v4_ops/fused_inv_rope_fp8_quant.py` | shipped, on by default | 4.36x kernel-isolated |
+| **K7** -- indexer-Q RoPE + fp8 quant | `v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py` | shipped, on by default | 7.38x kernel-isolated |
+| **K10-dequant** -- fp8 K-cache dequant inner | `third_party/flashmla/flash_mla_interface.py` | shipped, on by default | 7.01x kernel-isolated |
+| **K11** -- full fused FlashMLA decode | `third_party/flashmla/flash_mla_decode_sm86.py` | experimental, default OFF | parity correct (max diff 1e-3); E2E -71% because grid is (1, B*H_block) so only 1-4 SMs run while cuBLAS uses all 68. Needs split-K rework. `VLLM_SM86_K11=1` to try. |
+| **K12** -- fused paged-MQA logits | `utils/fp8_paged_mqa_logits_sm86.py` | experimental, default OFF | 3.6x kernel-isolated; parity at 5e-2 abs threshold. E2E -3% because residual bf16 reduction-order noise vs cuBLAS reshuffles the sparse indexer top-K (drops MTP draft acceptance). `VLLM_SM86_K12=1` to try. |
 
-Aggregate E2E gain (eager): 1.67 -> 2.01 tok/s (+20%, accounting for cache-stable allocation reuse from the cudagraph fix).
-With PIECEWISE capture: 1.67 -> 2.58 tok/s (+54%).
+Aggregate E2E gain from K6 + K7 + K10 (eager): 1.67 -> 2.01 tok/s (+20%, accounting for cache-stable allocation reuse from the cudagraph fix).
+With PIECEWISE capture: 1.67 -> 2.6 tok/s (+55%).
+
+### Why K11 / K12 are experimental
+
+- **K11**: cuBLAS is heavily tuned for the small-GEMM shapes that DSv4's sparse decode produces, and uses all 68 SMs via internal split-K. A single fused Triton program at decode shape uses 1-4 SMs and loses despite saving global-memory traffic. Path forward: FlashDecoding-style 2-kernel split-K (partial-state workspace + reduction). Code skeleton + parity harness preserved.
+- **K12**: the kernel is correct, but it feeds the sparse indexer's argmax/top-K. bf16 reduction-order differences (~5e-2 max per logit) shift top-K choices for marginal scores, and downstream behavior diverges enough to outweigh per-call kernel speedup. Lesson: kernels that feed an order-sensitive consumer need cuBLAS-equivalent reduction order, not just per-element parity. K6/K7/K10 work because their outputs flow into more matmuls (which absorb noise) rather than into argmax.
 
 K8/K9 (compressor) Triton ports were attempted and reverted: bit-exact parity but 44% E2E regression because per-token launch overhead dominates when most tokens early-exit on the compress_ratio condition. The reference Triton code is preserved in-file but dispatch points back to the pyref.
-
-A full K10 FlashAttention-2-style decode kernel is still future work; the current K10 only swaps the FP8 dequant inner kernel.
 
 ## PIECEWISE cudagraph fix
 

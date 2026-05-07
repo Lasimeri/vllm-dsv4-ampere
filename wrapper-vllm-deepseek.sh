@@ -11,11 +11,20 @@
 #   to either OOM, run extremely slowly, or fail on FP8 kernel dispatch.
 #   Recommended target: H100/H200/B200 class hardware, or a quantized rebuild.
 #
-# MODEL_PATH: prefer a local checkpoint at /llms/archive/deepseek-v4-flash if
-# you mirror weights locally; otherwise vLLM will pull from HF on first run.
+# Configure for your setup:
+#   VLLM_BIN     path to the vllm CLI (default: `which vllm`)
+#   MODEL_PATH   HF id or local snapshot directory (default: deepseek-ai/DeepSeek-V4-Flash)
+#                vLLM will download from HF on first run unless MODEL_PATH points to a local mirror.
 
-export CUDA_HOME=/opt/cuda
-export PATH="/opt/cuda/bin:$PATH"
+# Find the vllm binary; override via VLLM_BIN env var if needed.
+VLLM_BIN="${VLLM_BIN:-$(command -v vllm 2>/dev/null)}"
+if [ -z "$VLLM_BIN" ] || [ ! -x "$VLLM_BIN" ]; then
+  echo "ERROR: vllm CLI not found. Set VLLM_BIN=/path/to/vllm or activate the venv first." >&2
+  exit 1
+fi
+
+export CUDA_HOME="${CUDA_HOME:-/opt/cuda}"
+export PATH="${CUDA_HOME}/bin:$PATH"
 export PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=600
@@ -30,9 +39,8 @@ export NVIDIA_TF32_OVERRIDE=0
 export VLLM_MXFP4_USE_MARLIN=1
 
 MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
-[ -d "/llms/archive/deepseek-v4-flash" ] && MODEL_PATH="/llms/archive/deepseek-v4-flash"
 
-exec /home/lasi/vllm-env/bin/vllm serve "$MODEL_PATH" \
+exec "$VLLM_BIN" serve "$MODEL_PATH" \
   --served-model-name "DeepSeek-V4-Flash" \
   --trust-remote-code \
   --tokenizer-mode deepseek_v4 \

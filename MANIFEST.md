@@ -100,8 +100,9 @@ mechanism never fires.
 How to restore
 --------------
 ./install.sh /path/to/your/vllm-env/lib/python3.X/site-packages/vllm
-cp wrapper-vllm-deepseek.sh /home/lasi/bin/vllm-deepseek
-chmod +x /home/lasi/bin/vllm-deepseek
+cp wrapper-vllm-deepseek.sh ~/bin/vllm-deepseek    # or anywhere in $PATH
+chmod +x ~/bin/vllm-deepseek
+# then edit ~/bin/vllm-deepseek and set VLLM_BIN + MODEL_PATH for your setup.
 
 Envvar override
 ---------------
