@@ -6,8 +6,15 @@ import torch
 import triton
 import triton.language as tl
 
-import vllm._flashmla_C
-flash_mla_cuda = torch.ops._flashmla_C
+try:
+    import vllm._flashmla_C  # noqa: F401
+
+    flash_mla_cuda = torch.ops._flashmla_C
+except (ImportError, ModuleNotFoundError):
+    # SM86: _flashmla_C is a Hopper kernel and is not built. The pure-PyTorch
+    # reference paths below do not use it; only the (unused on SM86) CUDA
+    # entry points reference flash_mla_cuda.
+    flash_mla_cuda = None
 
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _fp8_e4m3fn_byte_to_bf16,

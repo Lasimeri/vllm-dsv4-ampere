@@ -162,6 +162,67 @@ DeepSeek released V4-Flash on 2026-04-24 with day-zero vLLM support targeted at 
 
 This repo is the result of methodically replacing each architectural wall with a pure-PyTorch reference until the model produces coherent output end-to-end on Ampere, then writing hand-tuned SM86 Triton kernels for the highest-leverage hot paths.
 
+## INT4 / AutoRound (W4A16) variant
+
+The original patch set targets `deepseek-ai/DeepSeek-V4-Flash` (FP4 experts + FP8
++ BF16). These patches **also** run the INT4 quant, `Intel/DeepSeek-V4-Flash-W4A16-AutoRound`
+(~145 GiB; experts int4 via `auto_round:auto_gptq`, plus selective bf16 layers).
+Most changes are backward-compatible (they branch on checkpoint structure), so the
+same tree serves both checkpoints.
+
+**Base commit:** captured/validated against vLLM `c2fb0133` (2026-04-30) — 1 day
+past the original snapshot, so a few base-drift fixes are included below.
+
+**Key finding:** the int4 experts run the **hardware Marlin kernel**
+(`Using 'MARLIN' WNA16 MoE backend`) — weight dequant is *not* the bottleneck.
+The decode floor is the sparse-MLA + indexer pyref (V4's DSA has no Ampere kernel).
+Measured **~3.84 tok/s** on 8x RTX 3080 20GB (PIECEWISE, `--cpu-offload-gb 8`,
+ctx 32k), coherent generation + valid tool calls.
+
+### Build note (gcc >= 15)
+
+vLLM's pre-stable-ABI `_C` target pulls torch 2.11's full C++ headers, which
+**gcc-15.3 rejects** (`List_inl.h` two-phase template lookup). Build the base vLLM
+with **clang** as the CUDA host compiler — clang accepts the headers and CUDA 13.x
+accepts clang (GNU libstdc++, ABI-compatible with the gcc-built torch):
+
+```bash
+CC=clang CXX=clang++ NVCC_CCBIN=clang++ TORCH_CUDA_ARCH_LIST=8.6 \
+  uv pip install -e . --no-build-isolation
+```
+
+### Additional patches (on top of the base set)
+
+New:
+- `model_executor/models/deepseek_v4.py` — default `scale_fmt` to `ue8m0` when the
+  checkpoint's `quantization_config` omits it (AutoRound does).
+- `model_executor/layers/sparse_attn_indexer.py` — let the DeepGEMM guard pass when
+  `_use_sm86_reference()` is active.
+- `model_executor/layers/deepseek_v4_attention.py` — o-proj branches to a bf16 path
+  (opaque op `deepseek_v4_o_proj_bf16_sm86`, registered in `_attention_ops`) when
+  `wo_a` is bf16 (AutoRound) instead of fp8.
+- `v1/attention/ops/flashmla.py` — route FlashMLA entry points to the SM86 pyref
+  interface when `_flashmla_C` is absent (instead of stubbing to `_raise`).
+
+Updated:
+- `third_party/flashmla/flash_mla_interface.py` — guard the unconditional
+  `import vllm._flashmla_C` (not built on SM86; pyref paths don't use it).
+- `model_executor/layers/deepseek_compressor.py` — use the precomputed gate output
+  (c2fb0133 moved the gate GEMM into `attn_gemm_parallel_execute`; the snapshot
+  version re-applied it -> shape error).
+- `config/compilation.py` — add `PassConfig.fuse_mla_dual_rms_norm`,
+  `CompilationConfig.encoder_compilation_time` (base-drift), and the new o-proj op
+  to `_attention_ops`.
+- `compilation/backends.py` — accept the `is_encoder` kwarg (base-drift).
+
+### Runtime dependency fix (not a vLLM patch)
+
+`prometheus_fastapi_instrumentator` 500s every request on this vLLM
+(`_IncludedRouter` has no `.path`). One-line fix in its
+`routing.py` `_get_route_name` (2 sites): `route_name = getattr(route, "path", None)`.
+
+Run with `wrapper-vllm-deepseek-int4.sh` (set `VLLM_BIN` / `MODEL_PATH`).
+
 ## License
 
 Patches are derivative of vLLM (Apache 2.0). This repo follows the same license.

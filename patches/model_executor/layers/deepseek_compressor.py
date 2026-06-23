@@ -278,11 +278,12 @@ class DeepseekCompressor(nn.Module):
         rotary_emb,
     ) -> None:
         num_tokens, _ = x.shape
-        # bf16 weights/activations but fp32 output for numerical stability of
-        # the downstream compressor math.
-        kv_score = cublas_gemm_bf16_bf16_fp32(x, self.fused_wkv_wgate.weight)
-        # Each of shape [num_tokens, coff * self.head_dim]
-        # input bf16, output are fp32
+        # Base c2fb0133 precomputes the gate (fused_wkv_wgate) in
+        # attn_gemm_parallel_execute and passes its fp32 output here (the param
+        # is named x but is the gate output, not hidden_states). Use it directly;
+        # the 04-29 patch re-applied the gate internally -> double-gate shape err.
+        kv_score = x
+        # Each of shape [num_tokens, coff * self.head_dim]; fp32.
         kv, score = kv_score.split(
             [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
         )
