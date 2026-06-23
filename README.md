@@ -2,9 +2,21 @@
 
 Patches that let **DeepSeek-V4-Flash** run on **Ampere SM 8.6** GPUs (RTX 30xx) under vLLM.
 
-Status: **working with PIECEWISE cudagraph capture**. Generates coherent text, follows instructions, emits valid OpenAI-compatible tool calls. **~2.6 tok/s** sustained decode at short context on 8x RTX 3080 20GB (vLLM 0.1.dev15830+g8d599d76a, PIECEWISE compile + capture). Eager-mode fallback runs at ~2.01 tok/s.
+Status: **working with PIECEWISE cudagraph capture**. Generates coherent text, follows instructions, emits valid OpenAI-compatible tool calls. Decode at short context on 8x RTX 3080 20GB: **4.51 tok/s** on `int4-autoround-support` (Intel INT4 AutoRound + K13), **2.6 tok/s** on `master` (deepseek-ai FP4+FP8). See the [Branches](#branches) table for the per-branch breakdown. Eager-mode fallback on `master` runs at ~2.01 tok/s.
 
 This is a starting point for the community. Upstream vLLM rejects FP8/sparse-MLA/DeepGEMM support on SM<90 ("SM80 support better lives in a fork", per @youkaichao on PR #40906). This repo replaces every blocking kernel with either a pure-PyTorch reference path or a hand-written SM86 Triton kernel that engages BF16 tensor cores.
+
+## Branches
+
+All branches target 8x RTX 3080 20GB (SM 8.6), TP=8, PIECEWISE cudagraph capture. Pick by which checkpoint and which vLLM base you have.
+
+| Branch | Checkpoint | vLLM base | Decode tok/s (short ctx) | Notes |
+| --- | --- | --- | --- | --- |
+| `master` | `deepseek-ai/DeepSeek-V4-Flash` (FP4 + FP8) | main @ 2026-04-27 (PR #40860), pinned `0.1.dev15830+g8d599d76a` | **2.6** PIECEWISE / 2.01 eager | Original SM86 patch set: pyref + K6/K7/K10 Triton kernels. |
+| `compat/vllm-0.20.1` | `deepseek-ai/DeepSeek-V4-Flash` | `vllm==0.20.1` (PyPI) | not yet E2E-validated | Patches apply cleanly + all `torch.ops.vllm.*` ops register; full inference unverified (see issue #3). |
+| `int4-autoround-support` | `Intel/DeepSeek-V4-Flash-W4A16-AutoRound` (INT4 W4A16) | main @ `c2fb0133` (2026-04-30), clang build | **4.51** PIECEWISE (3.84 before K13) | INT4 AutoRound model: routed experts run the hardware Marlin int4 kernel; adds the K13 split-K FlashMLA decode kernel (+17% over 3.84). This is the current development branch. |
+
+The **int4-autoround-support** branch is the fastest because (a) the AutoRound experts use hardware Marlin int4 (no software dequant) and (b) the K13 split-K FlashMLA decode kernel fills the SMs at the TP=8 decode shape. The decode floor on every branch is the sparse-MLA/indexer path, which has no native Ampere kernel.
 
 > **Note on the vLLM base commit:** the repo above pins `0.1.dev15830+g8d599d76a` (commit `8d599d76a`) which was an intermediate hash on the upstream PR #40860 ("DeepSeek V4 Rebased") staging tree. That commit was squash-merged into vllm-project/vllm `main` on 2026-04-27 and the original hash garbage-collected, so it no longer resolves on github.com/vllm-project/vllm. **Functionally equivalent state**: any vllm-project/vllm `main` checkout from 2026-04-27 onwards (or the v0.20.x patch line) is structurally compatible. Apply the patches in `patches/` on top.
 
@@ -58,7 +70,7 @@ The pyref paths auto-activate when `torch.cuda.get_device_capability() < (9, 0)`
 | --- | --- | --- |
 | `VLLM_SM86_DEEPSEEK_V4_REF` | auto | `1` force enable on Hopper+ (testing); `0` force disable on Ampere |
 | `VLLM_SM86_K11` | `0` | `1` enable OLD single-program fused FlashMLA decode (superseded by K13; single-program grid uses 1-4 SMs and loses to cuBLAS -- kept for reference) |
-| `VLLM_SM86_K12` | `0` | `1` enable experimental fused paged-MQA logits kernel (3.6x kernel-isolated, but bf16 reduction-order noise vs cuBLAS shifts sparse top-K and breaks MTP draft acceptance; default off) |
+| `VLLM_SM86_K12` | `0` | `1` enable the fused fp32 paged-MQA logits (indexer) kernel. Now computes true-fp32 logits (4.33x kernel-isolated at the serve shape, perfect top-512 overlap with the fp32-true ranking -- strictly more faithful than the bf16 pyref). Default OFF for **memory**, not numerics: JIT-loading the Triton module at gpu-mem-util 0.95 OOMs on the first decode call, and the per-call pyref fallback costs ~5x E2E. Enable with headroom (`--gpu-memory-utilization 0.90`). |
 | `VLLM_SM86_K13` | `1` | `0` disable the split-K (FlashDecoding) FlashMLA decode kernel. K13 is the realized split-K rework of K11: partial-state kernel over (B, H-tile, K-split) + log-sum-exp combine, filling the SMs. **3.1x over pyref at the TP=8 serve shape (460->148 us/call), +17% E2E decode (3.84 -> 4.51 tok/s)**, bf16 ULP parity. ON by default. |
 | `VLLM_MXFP4_USE_MARLIN` | required `1` | Wrapper sets this. Marlin is the only MoE backend that supports `kMxfp4Static` below SM90 (DeepGEMM FP4 needs SM100+, TRTLLM needs SM90+) |
 
@@ -128,7 +140,7 @@ Six kernels written by hand for SM86 (no native fp8e4nv, no TMA, no FP4). The sh
 | **K7** -- indexer-Q RoPE + fp8 quant | `v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py` | shipped, on by default | 7.38x kernel-isolated |
 | **K10-dequant** -- fp8 K-cache dequant inner | `third_party/flashmla/flash_mla_interface.py` | shipped, on by default | 7.01x kernel-isolated |
 | **K11** -- full fused FlashMLA decode (single-program) | `third_party/flashmla/flash_mla_decode_sm86.py` | superseded by K13, default OFF | parity correct (max diff 1e-3); E2E -71% because grid is (1, B*H_block) so only 1-4 SMs run while cuBLAS uses all 68. Realized as K13. `VLLM_SM86_K11=1` to try the old path. |
-| **K12** -- fused paged-MQA logits | `utils/fp8_paged_mqa_logits_sm86.py` | experimental, default OFF | 3.6x kernel-isolated; parity at 5e-2 abs threshold. E2E -3% because residual bf16 reduction-order noise vs cuBLAS reshuffles the sparse indexer top-K (drops MTP draft acceptance). `VLLM_SM86_K12=1` to try. |
+| **K12** -- fused fp32 paged-MQA logits | `utils/fp8_paged_mqa_logits_sm86.py` | default OFF (memory-gated) | True-fp32 logits: matches a plain fp32 einsum to ~1e-5 and has **perfect top-512 overlap** with the fp32-true ranking (the bf16 pyref misses 1-3 of the true top-512). 4.33x kernel-isolated at the serve shape (74 vs 319 us/call). Default OFF only because JIT-loading the module at gpu-mem-util 0.95 OOMs (per-call fallback -> 5x E2E regression); needs headroom. `VLLM_SM86_K12=1` + `--gpu-memory-utilization 0.90`. |
 | **K13** -- split-K FlashMLA decode | `third_party/flashmla/flash_mla_decode_sm86.py` (`_flash_mla_decode_sm86_splitk`) | **shipped, ON by default** | The split-K rework K11 needed. Partial kernel grid (B, H-tile, K-split) runs online-softmax over K-slices into scratch; combine kernel merges via log-sum-exp. Fills the SMs (16 programs vs K11's 1-4 at the TP=8 serve shape). **3.1x over pyref (460->148 us/call), +17% E2E (3.84 -> 4.51 tok/s)**, bf16 ULP parity. `VLLM_SM86_K13=0` to disable. |
 
 Aggregate E2E gain from K6 + K7 + K10 (eager): 1.67 -> 2.01 tok/s (+20%, accounting for cache-stable allocation reuse from the cudagraph fix).
@@ -137,7 +149,7 @@ With PIECEWISE capture: 1.67 -> 2.6 tok/s (+55%).
 ### Why K11 / K12 are experimental
 
 - **K11 -> K13 (resolved)**: cuBLAS is heavily tuned for the small-GEMM shapes that DSv4's sparse decode produces, and uses all 68 SMs via internal split-K. A single fused Triton program (K11) at decode shape uses 1-4 SMs and loses despite saving global-memory traffic. The fix shipped as **K13**: FlashDecoding-style 2-kernel split-K (partial-state scratch over (B, H-tile, K-split) + log-sum-exp reduction). At the TP=8 serve shape the partial grid is 16 programs (vs 1-4), and K13 runs 3.1x faster than the pyref and +17% E2E. Parity harness: `test_k13.py`.
-- **K12**: the kernel is correct, but it feeds the sparse indexer's argmax/top-K. bf16 reduction-order differences (~5e-2 max per logit) shift top-K choices for marginal scores, and downstream behavior diverges enough to outweigh per-call kernel speedup. Lesson: kernels that feed an order-sensitive consumer need cuBLAS-equivalent reduction order, not just per-element parity. K6/K7/K10 work because their outputs flow into more matmuls (which absorb noise) rather than into argmax.
+- **K12 (numerics resolved, now memory-gated)**: the original bf16 kernel fed the sparse indexer's order-sensitive top-K, and bf16 reduction-order noise (~5e-2/logit) reshuffled marginal picks, dropping MTP draft acceptance. Resolved by computing the logit in **true fp32** (exact fp8->fp32 dequant, fp32 scale, IEEE fp32 dot): it now matches a plain fp32 einsum to ~1e-5 with perfect top-512 overlap -- the faithful path, not a noisy approximation, so the lesson "order-sensitive consumers need a faithful reduction" is satisfied by accuracy rather than by matching cuBLAS's order. It stays default-OFF for a different reason: at gpu-mem-util 0.95 the first decode call OOMs while JIT-loading the Triton module into the packed GPU, and the per-call pyref fallback costs ~5x. Enable it with `--gpu-memory-utilization 0.90` (or a warm-up launch before the KV cache fills).
 
 K8/K9 (compressor) Triton ports were attempted and reverted: bit-exact parity but 44% E2E regression because per-token launch overhead dominates when most tokens early-exit on the compress_ratio condition. The reference Triton code is preserved in-file but dispatch points back to the pyref.
 
