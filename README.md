@@ -57,8 +57,9 @@ The pyref paths auto-activate when `torch.cuda.get_device_capability() < (9, 0)`
 | Var | Default | Effect |
 | --- | --- | --- |
 | `VLLM_SM86_DEEPSEEK_V4_REF` | auto | `1` force enable on Hopper+ (testing); `0` force disable on Ampere |
-| `VLLM_SM86_K11` | `0` | `1` enable experimental fused FlashMLA decode kernel (correct, single-program grid loses to cuBLAS at decode shape -- left disabled for split-K rework) |
+| `VLLM_SM86_K11` | `0` | `1` enable OLD single-program fused FlashMLA decode (superseded by K13; single-program grid uses 1-4 SMs and loses to cuBLAS -- kept for reference) |
 | `VLLM_SM86_K12` | `0` | `1` enable experimental fused paged-MQA logits kernel (3.6x kernel-isolated, but bf16 reduction-order noise vs cuBLAS shifts sparse top-K and breaks MTP draft acceptance; default off) |
+| `VLLM_SM86_K13` | `1` | `0` disable the split-K (FlashDecoding) FlashMLA decode kernel. K13 is the realized split-K rework of K11: partial-state kernel over (B, H-tile, K-split) + log-sum-exp combine, filling the SMs. **3.1x over pyref at the TP=8 serve shape (460->148 us/call), +17% E2E decode (3.84 -> 4.51 tok/s)**, bf16 ULP parity. ON by default. |
 | `VLLM_MXFP4_USE_MARLIN` | required `1` | Wrapper sets this. Marlin is the only MoE backend that supports `kMxfp4Static` below SM90 (DeepGEMM FP4 needs SM100+, TRTLLM needs SM90+) |
 
 ## What's patched
@@ -119,22 +120,23 @@ See `MANIFEST.md` for the full per-file changelog including version-to-version d
 
 ## Hand-tuned SM86 Triton kernels
 
-Five kernels written by hand for SM86 (no native fp8e4nv, no TMA, no FP4). The shipped three follow haosdent's pattern from PR #40906 (Triton emits scaled fp32, eager casts to fp8 outside the compile region):
+Six kernels written by hand for SM86 (no native fp8e4nv, no TMA, no FP4). The shipped four: K6/K7/K10 follow haosdent's pattern from PR #40906 (Triton emits scaled fp32, eager casts to fp8 outside the compile region); K13 is a FlashDecoding split-K attention kernel:
 
 | Kernel | Path | Status | Speedup |
 | --- | --- | --- | --- |
 | **K6** -- inv-RoPE + fp8 quant | `v1/attention/ops/deepseek_v4_ops/fused_inv_rope_fp8_quant.py` | shipped, on by default | 4.36x kernel-isolated |
 | **K7** -- indexer-Q RoPE + fp8 quant | `v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py` | shipped, on by default | 7.38x kernel-isolated |
 | **K10-dequant** -- fp8 K-cache dequant inner | `third_party/flashmla/flash_mla_interface.py` | shipped, on by default | 7.01x kernel-isolated |
-| **K11** -- full fused FlashMLA decode | `third_party/flashmla/flash_mla_decode_sm86.py` | experimental, default OFF | parity correct (max diff 1e-3); E2E -71% because grid is (1, B*H_block) so only 1-4 SMs run while cuBLAS uses all 68. Needs split-K rework. `VLLM_SM86_K11=1` to try. |
+| **K11** -- full fused FlashMLA decode (single-program) | `third_party/flashmla/flash_mla_decode_sm86.py` | superseded by K13, default OFF | parity correct (max diff 1e-3); E2E -71% because grid is (1, B*H_block) so only 1-4 SMs run while cuBLAS uses all 68. Realized as K13. `VLLM_SM86_K11=1` to try the old path. |
 | **K12** -- fused paged-MQA logits | `utils/fp8_paged_mqa_logits_sm86.py` | experimental, default OFF | 3.6x kernel-isolated; parity at 5e-2 abs threshold. E2E -3% because residual bf16 reduction-order noise vs cuBLAS reshuffles the sparse indexer top-K (drops MTP draft acceptance). `VLLM_SM86_K12=1` to try. |
+| **K13** -- split-K FlashMLA decode | `third_party/flashmla/flash_mla_decode_sm86.py` (`_flash_mla_decode_sm86_splitk`) | **shipped, ON by default** | The split-K rework K11 needed. Partial kernel grid (B, H-tile, K-split) runs online-softmax over K-slices into scratch; combine kernel merges via log-sum-exp. Fills the SMs (16 programs vs K11's 1-4 at the TP=8 serve shape). **3.1x over pyref (460->148 us/call), +17% E2E (3.84 -> 4.51 tok/s)**, bf16 ULP parity. `VLLM_SM86_K13=0` to disable. |
 
 Aggregate E2E gain from K6 + K7 + K10 (eager): 1.67 -> 2.01 tok/s (+20%, accounting for cache-stable allocation reuse from the cudagraph fix).
 With PIECEWISE capture: 1.67 -> 2.6 tok/s (+55%).
 
 ### Why K11 / K12 are experimental
 
-- **K11**: cuBLAS is heavily tuned for the small-GEMM shapes that DSv4's sparse decode produces, and uses all 68 SMs via internal split-K. A single fused Triton program at decode shape uses 1-4 SMs and loses despite saving global-memory traffic. Path forward: FlashDecoding-style 2-kernel split-K (partial-state workspace + reduction). Code skeleton + parity harness preserved.
+- **K11 -> K13 (resolved)**: cuBLAS is heavily tuned for the small-GEMM shapes that DSv4's sparse decode produces, and uses all 68 SMs via internal split-K. A single fused Triton program (K11) at decode shape uses 1-4 SMs and loses despite saving global-memory traffic. The fix shipped as **K13**: FlashDecoding-style 2-kernel split-K (partial-state scratch over (B, H-tile, K-split) + log-sum-exp reduction). At the TP=8 serve shape the partial grid is 16 programs (vs 1-4), and K13 runs 3.1x faster than the pyref and +17% E2E. Parity harness: `test_k13.py`.
 - **K12**: the kernel is correct, but it feeds the sparse indexer's argmax/top-K. bf16 reduction-order differences (~5e-2 max per logit) shift top-K choices for marginal scores, and downstream behavior diverges enough to outweigh per-call kernel speedup. Lesson: kernels that feed an order-sensitive consumer need cuBLAS-equivalent reduction order, not just per-element parity. K6/K7/K10 work because their outputs flow into more matmuls (which absorb noise) rather than into argmax.
 
 K8/K9 (compressor) Triton ports were attempted and reverted: bit-exact parity but 44% E2E regression because per-token launch overhead dominates when most tokens early-exit on the compress_ratio condition. The reference Triton code is preserved in-file but dispatch points back to the pyref.
