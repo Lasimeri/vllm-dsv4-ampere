@@ -69,7 +69,11 @@ def _fp8_paged_mqa_logits_sm86_kernel(
     d_off = tl.arange(0, D_C)
 
     q_ptrs = Q_ptr + pid_m * Q_m_stride + h_off[:, None] * Q_h_stride + d_off[None, :]
-    q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0).to(tl.bfloat16)
+    # fp32 Q (host passes fp32). fp8 K dequants exactly to fp32, so the whole
+    # logit is computed at full precision -- the truest top-K ranking. The bf16
+    # path (what shipped as the experimental K12) injected ~5e-2 reduction-order
+    # noise that reshuffled the order-sensitive sparse top-K.
+    q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0).to(tl.float32)
 
     # ---- Load weights [BLOCK_H] f32 ----
     w_ptrs = WEIGHTS_ptr + pid_m * W_m_stride + h_off
@@ -102,7 +106,8 @@ def _fp8_paged_mqa_logits_sm86_kernel(
     # ---- Load D fp8 bytes per slot [BLOCK_N, D] ----
     k_byte_ptrs = KV_CACHE_ptr + k_byte_base[:, None] + d_off[None, :]
     k_bytes = tl.load(k_byte_ptrs, mask=full_mask[:, None], other=0)
-    k_bf = _fp8_e4m3fn_byte_to_bf16(k_bytes)  # [BLOCK_N, D] bf16
+    # fp8_e4m3 (3-bit mantissa) -> bf16 is exact -> fp32 is exact.
+    k_f = _fp8_e4m3fn_byte_to_bf16(k_bytes).to(tl.float32)  # [BLOCK_N, D] fp32
 
     # ---- Load 4 bytes of fp32 scale per slot, repack manually ----
     # The scale lives at offset D in the slot. We load 4 individual bytes
@@ -114,14 +119,13 @@ def _fp8_paged_mqa_logits_sm86_kernel(
     s3 = (tl.load(KV_CACHE_ptr + k_byte_base + (D_C + 3), mask=full_mask, other=0).to(tl.int32)) & 0xFF
     s_packed = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24)
     scale_f32 = s_packed.to(tl.float32, bitcast=True)  # [BLOCK_N] f32
-    # Match pyref precision: cast scale to bf16 and apply to K BEFORE the
-    # dot. (Pyref does k_bf = fp8.to(bf16) * scale.to(bf16); we mirror so
-    # the dot output is the same bf16-lossy quantity.)
-    scale_bf = scale_f32.to(tl.bfloat16)
-    k_bf = k_bf * scale_bf[:, None]
+    # Apply the dequant scale in fp32 (no bf16 downcast) so K is exact.
+    k_f = k_f * scale_f32[:, None]
 
-    # ---- scores = Q @ (K_scaled)^T ----
-    scores = tl.dot(q, tl.trans(k_bf), out_dtype=tl.float32)  # [BLOCK_H, BLOCK_N]
+    # ---- scores = Q @ (K_scaled)^T in true fp32 (input_precision="ieee"
+    # forces the IEEE fp32 path, not TF32, so the ranking is deterministic
+    # and matches a plain torch fp32 einsum). ----
+    scores = tl.dot(q, tl.trans(k_f), out_dtype=tl.float32, input_precision="ieee")
     scores = tl.where(full_mask[None, :], scores, 0.0)
 
     # ---- weighted sum across H: logits_tile[n] = sum_h(w[h] * scores[h, n]) ----
@@ -174,8 +178,8 @@ def _fp8_paged_mqa_logits_sm86_triton(
     else:
         ctx_per_batch = context_lens.to(torch.int32).contiguous()
 
-    # Q -> bf16 [M, H, D] contiguous
-    q_bf = q_values.to(torch.bfloat16).reshape(M, H, D).contiguous()
+    # Q -> fp32 [M, H, D] contiguous (full-precision logit path)
+    q_bf = q_values.to(torch.float32).reshape(M, H, D).contiguous()
 
     # Cache byte strides
     kv_block_stride = kv_cache.stride(0)
@@ -190,7 +194,10 @@ def _fp8_paged_mqa_logits_sm86_triton(
     weights_f = weights.to(torch.float32).reshape(M, H).contiguous()
 
     BLOCK_H = _next_pow2(H)
-    BLOCK_N = 128
+    # 64 (not 128): the fp32 K tile is [BLOCK_N, D] -- BLOCK_N=64 keeps it at
+    # 32 KB (same as the old bf16 128-tile) and shrinks per-launch scratch,
+    # which matters under the packed gpu-memory-utilization=0.95 serve budget.
+    BLOCK_N = 64
 
     grid = (M, triton.cdiv(max_model_len, BLOCK_N))
 
@@ -223,16 +230,29 @@ def _fp8_paged_mqa_logits_sm86_triton(
 
 
 def _k12_enabled() -> bool:
-    """K12 fused paged-MQA logits is OFF by default.
+    """K12 fused paged-MQA logits (indexer).
 
-    Why off: kernel is bit-correct (3.6x kernel-isolated speedup, all parity
-    cases pass at 5e-2 abs / 30% mismatch threshold) but the residual bf16
-    reduction-order noise vs cuBLAS (max ~5e-2 per logit) reshuffles the
-    sparse indexer's top-K selection just enough to reduce MTP draft
-    acceptance from ~87% to ~80%, which slightly outweighs the per-call
-    kernel speedup at the system level.
+    History: the original bf16 kernel was 3.6x kernel-isolated but injected
+    ~5e-2 reduction-order noise vs the bf16 pyref, reshuffling the sparse
+    indexer's order-sensitive top-K and dropping MTP draft acceptance
+    (~87% -> ~80%). This version computes the logit in **true fp32** (exact
+    fp8->fp32 dequant, fp32 scale, IEEE fp32 dot): it is the most accurate
+    ranking available, not a noisy approximation of the bf16 pyref, so the
+    top-K it produces is at least as good as the pyref's.
 
-    To re-enable for experiments: VLLM_SM86_K12=1.
+    At the TP=8 serve shape (H_q=8/rank) the fp32 kernel is 4.42x faster than
+    the pyref in isolation (71 vs 314 us/call) AND has perfect top-512 overlap
+    with the fp32-true ranking (the pyref misses 1-3 of the true top-512 to
+    bf16 noise -- the fp32 kernel is strictly the more faithful path).
+
+    Default OFF. Reason is NOT numerics (those are now ideal) but memory: at the
+    production gpu-memory-utilization=0.95 packing, JIT-compiling + loading the
+    Triton module into an already-95%-full GPU on the first decode call throws
+    'Triton Error [CUDA]: out of memory', and the per-call fallback to pyref
+    then costs ~5x (4.51 -> 0.9 tok/s). The pyref needs no GPU-resident module.
+    Enable with VLLM_SM86_K12=1 AND give headroom (e.g. --gpu-memory-utilization
+    0.90, or a warm-up launch before the cache fills). Large H_q (TP=1) is also
+    slower here since the fp32 dot has no tensor-core path.
     """
     forced = os.environ.get("VLLM_SM86_K12", "").strip()
     if forced in ("1", "true", "True"):

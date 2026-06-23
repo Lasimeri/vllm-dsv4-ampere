@@ -686,6 +686,25 @@ def fp8_fp4_paged_mqa_logits(
                 "SM86 reference: FP4 paged MQA path not implemented. "
                 "Disable use_fp4_indexer_cache or run on SM>=90."
             )
+        # K12: fused fp32 paged-MQA logits Triton kernel (gated). Fuses paged
+        # gather + exact fp8->fp32 dequant + Q@K + per-head weighted sum,
+        # parallelised across (M, K-tile) to fill the SMs. Falls back to the
+        # pyref on any error.
+        try:
+            from vllm.utils.fp8_paged_mqa_logits_sm86 import (
+                _fp8_paged_mqa_logits_sm86_triton,
+                _k12_enabled,
+            )
+            if _k12_enabled():
+                return _fp8_paged_mqa_logits_sm86_triton(
+                    q_values, kv_cache, weights, context_lens,
+                    block_tables, max_model_len, clean_logits,
+                )
+        except Exception as _k12_e:
+            if os.environ.get("VLLM_SM86_K12_DEBUG"):
+                import traceback
+                print(f"[k12-indexer] fell back to pyref: {_k12_e!r}")
+                traceback.print_exc()
         return _fp8_paged_mqa_logits_pyref(
             q_values, kv_cache, weights, context_lens,
             block_tables, max_model_len, clean_logits,
