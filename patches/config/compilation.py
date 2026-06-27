@@ -144,6 +144,9 @@ class PassConfig:
     """Fuse the custom RMSNorm + padding ops."""
     fuse_rope_kvcache: bool = None  # type: ignore[assignment]
     """Fuse the QK rope + KV cache ops."""
+    fuse_mla_dual_rms_norm: bool = False
+    """Fuse MLA dual RMSNorm (referenced by c2fb0133 pass_manager; absent from
+    the 2026-04-29 patch-snapshot PassConfig -- added for base-drift compat)."""
 
     rope_kvcache_fusion_max_token_num: int = 256
     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
@@ -702,6 +705,9 @@ class CompilationConfig:
     """files that are traced for compilation"""
     compilation_time: float = field(default=0.0, init=False)
     """time taken for compilation"""
+    encoder_compilation_time: float = field(default=0.0, init=False)
+    """time taken for encoder compilation (base-drift compat: c2fb0133
+    gpu_worker reads this; absent from the 2026-04-29 patch snapshot)."""
 
     static_forward_context: dict[str, Any] = field(default_factory=dict, init=False)
     """Per-model forward context
@@ -740,6 +746,7 @@ class CompilationConfig:
         "vllm::per_token_group_quant_fp8_packed_deepgemm_sm86",
         "vllm::deepseek_v4_fused_inv_rope_fp8_quant_sm86",
         "vllm::deepseek_v4_fused_indexer_q_rope_quant_sm86",
+        "vllm::deepseek_v4_o_proj_bf16_sm86",
     ]
 
     def compute_hash(self) -> str:

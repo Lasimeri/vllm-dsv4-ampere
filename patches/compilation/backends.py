@@ -265,6 +265,7 @@ class CompilerManager:
         compile_range: Range,
         graph_index: int = 0,
         num_graphs: int = 1,
+        is_encoder: bool = False,  # base-drift compat (c2fb0133 passes this)
     ) -> Any:
         if graph_index == 0:
             # before compiling the first graph, record the start time

@@ -6,8 +6,15 @@ import torch
 import triton
 import triton.language as tl
 
-import vllm._flashmla_C
-flash_mla_cuda = torch.ops._flashmla_C
+try:
+    import vllm._flashmla_C  # noqa: F401
+
+    flash_mla_cuda = torch.ops._flashmla_C
+except (ImportError, ModuleNotFoundError):
+    # SM86: _flashmla_C is a Hopper kernel and is not built. The pure-PyTorch
+    # reference paths below do not use it; only the (unused on SM86) CUDA
+    # entry points reference flash_mla_cuda.
+    flash_mla_cuda = None
 
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _fp8_e4m3fn_byte_to_bf16,
@@ -15,8 +22,11 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 
 from vllm.third_party.flashmla.flash_mla_decode_sm86 import (
     _flash_mla_decode_sm86_triton,
+    _flash_mla_decode_sm86_splitk,
     _k11_enabled,
+    _k13_enabled,
 )
+from vllm.utils.sm86_prof import span as _prof_span
 
 
 @triton.jit
@@ -305,14 +315,15 @@ def _flash_mla_decode_pyref(
                 else swa_idx.shape[0]
             )
             swa_idx_v = swa_idx[:swa_len]
-            try:
-                k_swa, mask_swa = _dequant_fp8_kv_slots_sm86_triton(
-                    k_cache, swa_idx_v, head_dim_v, head_dim_rope
-                )
-            except Exception:
-                k_swa, mask_swa = _dequant_fp8_kv_slots(
-                    k_cache, swa_idx_v, head_dim_v, head_dim_rope
-                )
+            with _prof_span("mla_decode.dequant_kv"):
+                try:
+                    k_swa, mask_swa = _dequant_fp8_kv_slots_sm86_triton(
+                        k_cache, swa_idx_v, head_dim_v, head_dim_rope
+                    )
+                except Exception:
+                    k_swa, mask_swa = _dequant_fp8_kv_slots(
+                        k_cache, swa_idx_v, head_dim_v, head_dim_rope
+                    )
 
             if extra_k_cache is not None and extra_indices_in_kvcache is not None:
                 ex_idx = (
@@ -350,25 +361,27 @@ def _flash_mla_decode_pyref(
             # The trailing q_pe dims would normally pair with k_pe stored
             # separately; in the SM86 pyref we approximate by truncating.
             common = min(q_bs.shape[-1], K.shape[-1])
-            logits = (q_bs[..., :common] @ K[..., :common].transpose(-1, -2)).to(
-                torch.float32
-            ) * softmax_scale
-            logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
+            with _prof_span("mla_decode.qk_softmax"):
+                logits = (q_bs[..., :common] @ K[..., :common].transpose(-1, -2)).to(
+                    torch.float32
+                ) * softmax_scale
+                logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
 
-            max_logit = logits.amax(dim=-1, keepdim=True)
-            max_logit = torch.where(
-                torch.isinf(max_logit), torch.zeros_like(max_logit), max_logit
-            )
-            exp_logits = (logits - max_logit).exp()
-            denom = exp_logits.sum(dim=-1, keepdim=True)
-            if sink is not None:
-                sink_term = (sink.view(H_q, 1) - max_logit).exp()
-                denom = denom + sink_term
-            probs = (exp_logits / denom).to(torch.bfloat16)
+                max_logit = logits.amax(dim=-1, keepdim=True)
+                max_logit = torch.where(
+                    torch.isinf(max_logit), torch.zeros_like(max_logit), max_logit
+                )
+                exp_logits = (logits - max_logit).exp()
+                denom = exp_logits.sum(dim=-1, keepdim=True)
+                if sink is not None:
+                    sink_term = (sink.view(H_q, 1) - max_logit).exp()
+                    denom = denom + sink_term
+                probs = (exp_logits / denom).to(torch.bfloat16)
 
-            V = K[:, :head_dim_v]
-            out_bs = (probs @ V).to(out.dtype)
-            out_view[b, s].copy_(out_bs)
+            with _prof_span("mla_decode.pv"):
+                V = K[:, :head_dim_v]
+                out_bs = (probs @ V).to(out.dtype)
+                out_view[b, s].copy_(out_bs)
             lse[b, :, s] = (max_logit.squeeze(-1) + denom.squeeze(-1).log()).to(
                 torch.float32
             )
@@ -569,6 +582,22 @@ def flash_mla_with_kvcache(
                 q.shape[0], q.shape[1], q.shape[2], head_dim_v,
                 dtype=q.dtype, device=q.device,
             )
+        # K13 fast path: split-K (FlashDecoding) fused kernel. Decode-only.
+        if _k13_enabled() and q.shape[1] == 1 and head_dim_v == 512:
+            try:
+                return _flash_mla_decode_sm86_splitk(
+                    q=q, k_cache=k_cache, head_dim_v=head_dim_v,
+                    indices=indices_in_kvcache, topk_length=topk_length,
+                    attn_sink=attn_sink, softmax_scale=softmax_scale,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices_in_kvcache,
+                    extra_topk_length=extra_topk_length, out=out,
+                )
+            except Exception as _k13_e:
+                if os.environ.get("VLLM_SM86_K11_DEBUG"):
+                    import traceback
+                    print(f"[k13] fell back: {_k13_e!r}")
+                    traceback.print_exc()
         # K11 fast path: fused Triton decode kernel. Decode-only (S_q == 1).
         if _k11_enabled() and q.shape[1] == 1 and head_dim_v == 512:
             try:

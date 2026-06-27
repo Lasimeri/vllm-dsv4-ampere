@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.math_utils import cdiv
+from vllm.utils.sm86_prof import span as _prof_span
 
 _DEEPGEMM_BLACKWELL_EXCLUDED_MODEL_TYPES: set[str] = {
     "qwen3_5_text",
@@ -618,22 +619,24 @@ def _fp8_paged_mqa_logits_pyref(
             continue
         n_blocks = (ctx + block_size - 1) // block_size
         bt = block_tables[b, :n_blocks].to(torch.long)
-        rows = kv_cache[bt].reshape(n_blocks * block_size, cache_dim)[:ctx]
-        rows = rows.contiguous()
-        k_bytes = rows[:, :D].contiguous()
-        scale_bytes = rows[:, D : D + 4].contiguous()
-        scales = scale_bytes.view(torch.float32).squeeze(-1).to(torch.bfloat16)
-        k_fp8 = k_bytes.view(torch.float8_e4m3fn)
-        k_bf = k_fp8.to(torch.bfloat16) * scales.unsqueeze(-1)
+        with _prof_span("idx_logits.gather_dequant"):
+            rows = kv_cache[bt].reshape(n_blocks * block_size, cache_dim)[:ctx]
+            rows = rows.contiguous()
+            k_bytes = rows[:, :D].contiguous()
+            scale_bytes = rows[:, D : D + 4].contiguous()
+            scales = scale_bytes.view(torch.float32).squeeze(-1).to(torch.bfloat16)
+            k_fp8 = k_bytes.view(torch.float8_e4m3fn)
+            k_bf = k_fp8.to(torch.bfloat16) * scales.unsqueeze(-1)
 
         m_start = b * next_n
         m_end = m_start + next_n
         q_b = q_bf[m_start:m_end]
-        scores = torch.einsum("mhd,nd->mhn", q_b, k_bf)
-        w_b = weights[m_start:m_end].to(torch.float32)
-        logits[m_start:m_end, :ctx] = (
-            w_b.unsqueeze(-1) * scores.to(torch.float32)
-        ).sum(dim=1)
+        with _prof_span("idx_logits.matmul_wsum"):
+            scores = torch.einsum("mhd,nd->mhn", q_b, k_bf)
+            w_b = weights[m_start:m_end].to(torch.float32)
+            logits[m_start:m_end, :ctx] = (
+                w_b.unsqueeze(-1) * scores.to(torch.float32)
+            ).sum(dim=1)
 
     return logits
 
@@ -682,6 +685,30 @@ def fp8_fp4_paged_mqa_logits(
             raise NotImplementedError(
                 "SM86 reference: FP4 paged MQA path not implemented. "
                 "Disable use_fp4_indexer_cache or run on SM>=90."
+            )
+        # K12: fused fp32 paged-MQA logits Triton kernel (gated). Fuses paged
+        # gather + exact fp8->fp32 dequant + Q@K + per-head weighted sum,
+        # parallelised across (M, K-tile) to fill the SMs. Falls back to the
+        # pyref on any error.
+        try:
+            from vllm.utils.fp8_paged_mqa_logits_sm86 import (
+                _fp8_paged_mqa_logits_sm86_triton,
+                _k12_enabled,
+                _mark_k12_failed,
+            )
+            if _k12_enabled():
+                return _fp8_paged_mqa_logits_sm86_triton(
+                    q_values, kv_cache, weights, context_lens,
+                    block_tables, max_model_len, clean_logits,
+                )
+        except Exception as _k12_e:
+            # Latch off permanently so we don't pay the exception cost per call;
+            # the rest of the run uses the pyref cleanly.
+            _mark_k12_failed()
+            logger.warning(
+                "[k12-indexer] kernel failed (%r); disabling for this process, "
+                "using the pyref. Free GPU headroom (e.g. "
+                "--gpu-memory-utilization 0.90) to use it.", _k12_e,
             )
         return _fp8_paged_mqa_logits_pyref(
             q_values, kv_cache, weights, context_lens,

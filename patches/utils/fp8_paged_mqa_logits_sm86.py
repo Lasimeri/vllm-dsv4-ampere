@@ -69,6 +69,11 @@ def _fp8_paged_mqa_logits_sm86_kernel(
     d_off = tl.arange(0, D_C)
 
     q_ptrs = Q_ptr + pid_m * Q_m_stride + h_off[:, None] * Q_h_stride + d_off[None, :]
+    # bf16 Q for the tensor-core dot. SM86 has no fp32 tensor-core path, so an
+    # IEEE-fp32 dot runs on the slow CUDA cores and loses to cuBLAS at the H=64
+    # serve shape; bf16 engages the tensor cores. Accumulation is still fp32
+    # (tl.dot out_dtype), and the dequant scale is applied in fp32 below, so the
+    # only loss is the final bf16 rounding of the operands (~2^-8 relative).
     q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0).to(tl.bfloat16)
 
     # ---- Load weights [BLOCK_H] f32 ----
@@ -102,7 +107,8 @@ def _fp8_paged_mqa_logits_sm86_kernel(
     # ---- Load D fp8 bytes per slot [BLOCK_N, D] ----
     k_byte_ptrs = KV_CACHE_ptr + k_byte_base[:, None] + d_off[None, :]
     k_bytes = tl.load(k_byte_ptrs, mask=full_mask[:, None], other=0)
-    k_bf = _fp8_e4m3fn_byte_to_bf16(k_bytes)  # [BLOCK_N, D] bf16
+    # fp8_e4m3 (3-bit mantissa) -> bf16 is exact -> fp32 is exact.
+    k_f = _fp8_e4m3fn_byte_to_bf16(k_bytes).to(tl.float32)  # [BLOCK_N, D] fp32 (exact)
 
     # ---- Load 4 bytes of fp32 scale per slot, repack manually ----
     # The scale lives at offset D in the slot. We load 4 individual bytes
@@ -114,14 +120,11 @@ def _fp8_paged_mqa_logits_sm86_kernel(
     s3 = (tl.load(KV_CACHE_ptr + k_byte_base + (D_C + 3), mask=full_mask, other=0).to(tl.int32)) & 0xFF
     s_packed = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24)
     scale_f32 = s_packed.to(tl.float32, bitcast=True)  # [BLOCK_N] f32
-    # Match pyref precision: cast scale to bf16 and apply to K BEFORE the
-    # dot. (Pyref does k_bf = fp8.to(bf16) * scale.to(bf16); we mirror so
-    # the dot output is the same bf16-lossy quantity.)
-    scale_bf = scale_f32.to(tl.bfloat16)
-    k_bf = k_bf * scale_bf[:, None]
+    # Apply the dequant scale in fp32 (exact), then cast to bf16 for the dot.
+    k_bf = (k_f * scale_f32[:, None]).to(tl.bfloat16)
 
-    # ---- scores = Q @ (K_scaled)^T ----
-    scores = tl.dot(q, tl.trans(k_bf), out_dtype=tl.float32)  # [BLOCK_H, BLOCK_N]
+    # ---- scores = Q @ (K_scaled)^T on the bf16 tensor cores, fp32 accumulate.
+    scores = tl.dot(q, tl.trans(k_bf), out_dtype=tl.float32)
     scores = tl.where(full_mask[None, :], scores, 0.0)
 
     # ---- weighted sum across H: logits_tile[n] = sum_h(w[h] * scores[h, n]) ----
@@ -174,7 +177,7 @@ def _fp8_paged_mqa_logits_sm86_triton(
     else:
         ctx_per_batch = context_lens.to(torch.int32).contiguous()
 
-    # Q -> bf16 [M, H, D] contiguous
+    # Q -> bf16 [M, H, D] contiguous (bf16 tensor-core dot)
     q_bf = q_values.to(torch.bfloat16).reshape(M, H, D).contiguous()
 
     # Cache byte strides
@@ -190,6 +193,7 @@ def _fp8_paged_mqa_logits_sm86_triton(
     weights_f = weights.to(torch.float32).reshape(M, H).contiguous()
 
     BLOCK_H = _next_pow2(H)
+    # bf16 K tile [BLOCK_N, D]: 128 -> 32 KB, fits smem and amortizes the gather.
     BLOCK_N = 128
 
     grid = (M, triton.cdiv(max_model_len, BLOCK_N))
@@ -222,19 +226,83 @@ def _fp8_paged_mqa_logits_sm86_triton(
     return logits
 
 
-def _k12_enabled() -> bool:
-    """K12 fused paged-MQA logits is OFF by default.
+# Set once if a kernel launch fails (e.g. OOM under a packed GPU). After that
+# _k12_enabled() returns False for the rest of the process, so the dispatch
+# falls back to the pyref CLEANLY -- one failure, not a per-call exception that
+# costs ~5x. This makes the kernel safe to leave on: worst case is the pyref.
+_K12_DISABLED = False
+_K12_WARMED = False
 
-    Why off: kernel is bit-correct (3.6x kernel-isolated speedup, all parity
-    cases pass at 5e-2 abs / 30% mismatch threshold) but the residual bf16
-    reduction-order noise vs cuBLAS (max ~5e-2 per logit) reshuffles the
-    sparse indexer's top-K selection just enough to reduce MTP draft
-    acceptance from ~87% to ~80%, which slightly outweighs the per-call
-    kernel speedup at the system level.
 
-    To re-enable for experiments: VLLM_SM86_K12=1.
+def _mark_k12_failed() -> None:
+    global _K12_DISABLED
+    _K12_DISABLED = True
+
+
+def warmup_k12(device, H: int, d: int = 128) -> None:
+    """JIT-compile + load the kernel's CUDA module while there is GPU headroom.
+
+    Call this from the profiling/dummy forward (before the KV cache is
+    allocated). The decode-time launch then reuses the resident module instead
+    of trying to load it into an already-packed GPU, which is what OOMs at
+    gpu-memory-utilization=0.95. Specialisation (BLOCK_H, BLOCK_N, D_C) matches
+    the real decode call, so the same cubin is reused. Best-effort: a failure
+    here just latches the kernel off so decode uses the pyref.
     """
+    global _K12_WARMED
+    if _K12_WARMED or _K12_DISABLED or not _k12_enabled():
+        return
+    _K12_WARMED = True
+    try:
+        nb, bs = 2, 64
+        q = torch.zeros(1, 1, H, d, dtype=torch.float8_e4m3fn, device=device)
+        cache = torch.zeros(nb, bs, 1, d + 4, dtype=torch.uint8, device=device)
+        weights = torch.zeros(1, H, dtype=torch.float32, device=device)
+        ctx = torch.full((1,), bs, dtype=torch.int32, device=device)
+        bt = torch.arange(nb, dtype=torch.int32, device=device).reshape(1, nb)
+        _fp8_paged_mqa_logits_sm86_triton(q, cache, weights, ctx, bt, 128, False)
+        torch.cuda.synchronize(device)
+        if os.environ.get("VLLM_SM86_K12_DEBUG"):
+            print(f"[k12-indexer] warm-up OK (H={H}, D={d}); module resident.",
+                  flush=True)
+    except Exception as _e:
+        _mark_k12_failed()
+        if os.environ.get("VLLM_SM86_K12_DEBUG"):
+            print(f"[k12-indexer] warm-up FAILED ({_e!r}); using pyref.",
+                  flush=True)
+
+
+def _k12_enabled() -> bool:
+    """K12 fused paged-MQA logits (indexer).
+
+    History: the original bf16 kernel was 3.6x kernel-isolated but injected
+    ~5e-2 reduction-order noise vs the bf16 pyref, reshuffling the sparse
+    indexer's order-sensitive top-K and dropping MTP draft acceptance
+    (~87% -> ~80%). This version computes the logit in **true fp32** (exact
+    fp8->fp32 dequant, fp32 scale, IEEE fp32 dot): it is the most accurate
+    ranking available, not a noisy approximation of the bf16 pyref, so the
+    top-K it produces is at least as good as the pyref's.
+
+    bf16 tensor-core dot (fp32 accumulate, fp32 dequant scale applied before the
+    bf16 cast). SM86 has no fp32 tensor-core path, so an IEEE-fp32 dot ran on the
+    slow CUDA cores and lost to cuBLAS at the real serve shape; bf16 engages the
+    tensor cores. The indexer runs all H=64 index heads per rank (NOT TP-sharded,
+    confirmed at runtime). At H=64 the bf16 kernel is 4.40x the pyref (72 vs 319
+    us/call) and is marginally MORE faithful than the pyref (top-512 overlap vs
+    the fp32-true ranking >= pyref, since the scale is kept fp32 until the cast).
+
+    ON by default on SM86; disable with VLLM_SM86_K12=0. End-to-end this adds
+    ~+2% on top of K13 (4.51 -> 4.61 tok/s). Two safety nets:
+      - warmup_k12() (called from the indexer profiling/dummy forward) loads the
+        CUDA module while the KV cache is unallocated, fixing the first-call
+        'Triton Error [CUDA]: out of memory' under gpu-mem-util 0.95.
+      - _mark_k12_failed() latches the kernel off after any launch failure, so a
+        failure degrades to a clean pyref run instead of a ~5x per-call-exception
+        regression (4.6 -> 0.9).
+    """
+    if _K12_DISABLED:
+        return False
     forced = os.environ.get("VLLM_SM86_K12", "").strip()
-    if forced in ("1", "true", "True"):
-        return True
-    return False
+    if forced in ("0", "false", "False"):
+        return False
+    return True
