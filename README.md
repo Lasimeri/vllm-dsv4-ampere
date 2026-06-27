@@ -195,6 +195,40 @@ AutoRound branch with a single fused op `deepseek_v4_o_proj_inv_rope_bf16_sm86`
   not throughput. (Eager profiling overstated this region because it is
   op-count-heavy; the decode kernel hotspots were already taken by K13/K12.)
 
+## MTP speculative decode (works; batch=1 throughput-neutral on SM86)
+
+DeepSeek-V4-Flash ships a 1-layer MTP draft head (`num_nextn_predict_layers=1`;
+the Intel AutoRound checkpoint includes int4 `mtp.0.*` weights). vLLM supports it
+via `--speculative-config '{"method":"mtp","num_speculative_tokens":1}'`
+(`serve_mtp.sh`). Two findings:
+
+**Enabling it required a quant-config fix** (`patches/.../quantization/inc.py`).
+The AutoRound config marks `mtp.0.attn.wo_a` as 16-bit, but `auto-round` maps to
+`INCConfig`, which resolves per-module quant by the runtime prefix
+`model.layers.43.attn.wo_a` -- this never matches the checkpoint-named
+`mtp.0.attn.wo_a` override (the MTP model has no `hf_to_vllm_mapper` to bridge
+the two). So `wo_a` was built int4 while the checkpoint ships it bf16 -> `KeyError`
+on load, then `AttributeError: ... has no attribute 'weight'` in the forward.
+`INCConfig.get_layer_config` now matches `mtp.{i}.{suffix}` overrides by suffix
+for modules under the MTP block. **Without this, MTP crashes on load for any
+AutoRound DeepSeek-V4 checkpoint.** The draft head is excellent once loaded:
+**~87% acceptance, 1.88 mean acceptance length**, coherent output.
+
+**But decode tps is flat (4.70 -> ~4.6) at `max-num-seqs=1`, and the unlock is
+blocked on SM86.** The verify step processes `num_spec+1` tokens; to be fast it
+must be captured as a FULL (whole-forward) cudagraph. **FULL capture fails on
+SM86** (`cudaErrorStreamCaptureUnsupported`): the sparse-attention op's
+multi-stream event sync (`execute_in_parallel` across aux streams) plus
+data-dependent pyref work are stream-capture-illegal. PIECEWISE -- the only
+viable mode -- leaves attention eager in both draft and verify, so the doubled
+per-forward overhead cancels the acceptance gain. `num_speculative_tokens=2`
+additionally crashes in the SM86 compressor pyref (multi-token shape bug). Net:
+MTP loads and runs correctly but does not raise decode tps at batch=1 on SM86; it
+would help at batch>1 (verify amortized over sequences). Realizing the FULL-capture
+path would require making the SM86 sparse-attention ops cudagraph-FULL-compatible
+(no cross-stream events, no host syncs) -- a large rewrite, likely infeasible given
+the inherent data-dependence of top-k sparse attention.
+
 ## PIECEWISE cudagraph fix
 
 The repo ships PIECEWISE compile + capture as the default mode (configured in `wrapper-vllm-deepseek.sh`). Capture works because `per_token_group_quant_fp8_sm86` (and its packed-deepgemm sibling) now route their `(data, scale)` outputs through a shape-keyed persistent buffer cache.
