@@ -176,6 +176,25 @@ E2E TTFT (8x RTX 3080, INT4 AutoRound, gpu-mem-util 0.95, greedy), per-token loo
 
 *Before the indexer-tiling fix, prefills above ~1.5k tokens crash the engine; the tiling fix is what makes long-context prefill work at all on SM86. The MLA vectorization is the speed win on top. A/B note: the loop and vectorized paths produce identical generations (same greedy output, same in-context recall) -- the change moves only wall-clock, not behavior.
 
+## Decode o-projection: drop the fp8 round-trip (AutoRound)
+
+Accuracy/cleanup fix (decode-tps-neutral). The o-projection path quantized the
+attention output `o` to fp8 (`fused_inv_rope_fp8_quant`) and then immediately
+dequantized it back to bf16 inside `deepseek_v4_o_proj_bf16_sm86` to matmul
+against the bf16 `wo_a` -- the fp8 path's code reused for the AutoRound (W4A16,
+bf16 `wo_a`) checkpoint, where the fp8 detour is pure loss. Replaced for the
+AutoRound branch with a single fused op `deepseek_v4_o_proj_inv_rope_bf16_sm86`
+(inverse-RoPE in bf16 + the same grouped bf16 einsum), so `o` never touches fp8.
+
+- **Accuracy**: o-proj error vs an fp32 reference drops from **15% mean-rel
+  (max |Δ| 0.35)** to **0.37% (max |Δ| 0.029)** -- the fp8 round-trip was a real
+  precision leak on this checkpoint. Harness: `test_oproj.py`.
+- **Speed**: decode is **flat (4.70 -> 4.72 tok/s)**. Under PIECEWISE the removed
+  quant/dequant kernels are already captured into the cudagraph and near-free;
+  the `wo_a` read (the memory-bound cost) is unchanged. The win is correctness,
+  not throughput. (Eager profiling overstated this region because it is
+  op-count-heavy; the decode kernel hotspots were already taken by K13/K12.)
+
 ## PIECEWISE cudagraph fix
 
 The repo ships PIECEWISE compile + capture as the default mode (configured in `wrapper-vllm-deepseek.sh`). Capture works because `per_token_group_quant_fp8_sm86` (and its packed-deepgemm sibling) now route their `(data, scale)` outputs through a shape-keyed persistent buffer cache.

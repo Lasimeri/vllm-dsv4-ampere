@@ -303,24 +303,23 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
-        # O projection: inverse RoPE + FP8 quant + einsum + wo_b
-        o_fp8, o_scale = fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            n_groups=self.n_local_groups,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            tma_aligned_scales=self._tma_aligned_scales,
+        z = torch.empty(
+            (num_tokens, self.n_local_groups, self.o_lora_rank),
+            device=o.device,
+            dtype=torch.bfloat16,
         )
-
         if hasattr(self.wo_a, "weight_scale_inv"):
             # Original deepseek-ai checkpoint: wo_a is fp8 block-scaled.
-            z = torch.empty(
-                (num_tokens, self.n_local_groups, self.o_lora_rank),
-                device=o.device,
-                dtype=torch.bfloat16,
+            # O projection: inverse RoPE + per-block FP8 quant + fp8 einsum.
+            o_fp8, o_scale = fused_inv_rope_fp8_quant(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                tma_aligned_scales=self._tma_aligned_scales,
             )
             torch.ops.vllm.deepseek_v4_fp8_einsum(
                 o_fp8,
@@ -332,19 +331,20 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 list(self._einsum_recipe),
             )
         else:
-            # AutoRound (W4A16) keeps wo_a as bf16 (selective 16-bit, no fp8
-            # scale). Opaque op (split point) dequants o + grouped bf16 proj.
-            z = torch.empty(
-                (num_tokens, self.n_local_groups, self.o_lora_rank),
-                device=o.device,
-                dtype=torch.bfloat16,
-            )
-            torch.ops.vllm.deepseek_v4_o_proj_bf16_sm86(
-                o_fp8,
-                o_scale,
+            # AutoRound (W4A16) keeps wo_a as bf16. Fused inverse-RoPE + bf16
+            # grouped projection in one op -- skips the fp8 quant->dequant
+            # round-trip the fp8 path forces (saves the quant + dequant kernels
+            # per layer and the fp8 rounding; the wo_a read is identical).
+            torch.ops.vllm.deepseek_v4_o_proj_inv_rope_bf16_sm86(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
                 self.wo_a.weight,
                 z,
                 self.n_local_groups,
+                self.n_local_heads // self.n_local_groups,
+                self.nope_head_dim,
+                self.rope_head_dim,
                 self.o_lora_rank,
             )
 
@@ -637,6 +637,72 @@ direct_register_custom_op(
     op_func=deepseek_v4_o_proj_bf16_sm86,
     mutates_args=["out"],
     fake_impl=deepseek_v4_o_proj_bf16_sm86_fake,
+)
+
+
+def deepseek_v4_o_proj_inv_rope_bf16_sm86(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a_weight: torch.Tensor,
+    out: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+) -> None:
+    # AutoRound (W4A16, bf16 wo_a) fused o-projection: inverse RoPE directly in
+    # bf16 + grouped bf16 einsum. Skips the fp8 quant->dequant round-trip the
+    # shared path forces (fused_inv_rope_fp8_quant emits fp8, then the bf16
+    # o-proj immediately casts it back), removing the quant + dequant kernels
+    # per layer and the fp8 rounding. The wo_a read -- the memory-bound cost --
+    # is identical, so this is strictly fewer ops and higher fidelity. Opaque
+    # op (PIECEWISE split) because sm_86 Triton cannot codegen the fp8 dtypes in
+    # the neighbouring ops; the contents run eagerly either way.
+    T, H, D = o.shape
+    G, HG = n_groups, heads_per_group
+    # Inverse RoPE on the trailing rope_dim slots of each head (fp32 for parity
+    # with the fp8 path's reference): mirrors _fused_inv_rope_fp8_quant_pyref.
+    o_r = o.reshape(T, G, HG, D).to(torch.float32)
+    rope = o_r[..., nope_dim:]
+    rope_e = rope[..., 0::2]
+    rope_o = rope[..., 1::2]
+    cs = cos_sin_cache[positions.long()]
+    cos_v = cs[..., : rope_dim // 2][:, None, None, :]
+    sin_v = cs[..., rope_dim // 2 :][:, None, None, :]
+    new_e = rope_e * cos_v + rope_o * sin_v
+    new_o = rope_o * cos_v - rope_e * sin_v
+    rotated = torch.stack([new_e, new_o], dim=-1).flatten(-2)
+    o_full = o_r.clone()
+    o_full[..., nope_dim:] = rotated
+    # Grouped bf16 projection -- identical einsum to deepseek_v4_o_proj_bf16_sm86,
+    # fed the bf16 inv-roped o directly (no fp8 detour).
+    o_bgd = o_full.reshape(T, G, HG * D).to(torch.bfloat16)
+    wo_a_3d = wo_a_weight.to(torch.bfloat16).view(G, o_lora_rank, HG * D)
+    out.copy_(torch.einsum("bhr,hdr->bhd", o_bgd, wo_a_3d))
+
+
+def deepseek_v4_o_proj_inv_rope_bf16_sm86_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a_weight: torch.Tensor,
+    out: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_o_proj_inv_rope_bf16_sm86",
+    op_func=deepseek_v4_o_proj_inv_rope_bf16_sm86,
+    mutates_args=["out"],
+    fake_impl=deepseek_v4_o_proj_inv_rope_bf16_sm86_fake,
 )
 
 

@@ -17,7 +17,10 @@ import torch
 
 _ENABLED = os.environ.get("VLLM_SM86_PROFILE", "").strip() in ("1", "true", "True")
 # Dump every N trigger-label calls. 41 sparse layers/token -> ~5 tokens.
-_TRIGGER = "mla_decode.pv"
+# Trigger label is env-overridable: the default "mla_decode.pv" only fires on
+# the decode pyref (silent when K13/K12 kernels are ON), so decode-step
+# instrumentation sets VLLM_SM86_PROFILE_TRIGGER=dec.layer.
+_TRIGGER = os.environ.get("VLLM_SM86_PROFILE_TRIGGER", "mla_decode.pv").strip()
 _EVERY = int(os.environ.get("VLLM_SM86_PROFILE_EVERY", "200"))
 
 # Pending (start, end) event pairs per label, drained at each dump.
