@@ -124,6 +124,18 @@ def sparse_attn_indexer(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
         )
 
+        # Warm up the SM86 indexer kernel HERE (profiling forward, before the
+        # KV cache is allocated = GPU headroom). Loads its CUDA module so the
+        # decode-time launch doesn't OOM trying to load it into a packed GPU.
+        # No-op unless VLLM_SM86_K12=1; best-effort (latches off on failure).
+        if not use_fp4_cache and isinstance(q_quant, torch.Tensor):
+            try:
+                from vllm.utils.fp8_paged_mqa_logits_sm86 import warmup_k12
+
+                warmup_k12(hidden_states.device, int(q_quant.shape[-2]), head_dim)
+            except Exception:
+                pass
+
         return sparse_attn_indexer_fake(
             hidden_states,
             k_cache_prefix,

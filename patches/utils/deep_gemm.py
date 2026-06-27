@@ -694,6 +694,7 @@ def fp8_fp4_paged_mqa_logits(
             from vllm.utils.fp8_paged_mqa_logits_sm86 import (
                 _fp8_paged_mqa_logits_sm86_triton,
                 _k12_enabled,
+                _mark_k12_failed,
             )
             if _k12_enabled():
                 return _fp8_paged_mqa_logits_sm86_triton(
@@ -701,10 +702,14 @@ def fp8_fp4_paged_mqa_logits(
                     block_tables, max_model_len, clean_logits,
                 )
         except Exception as _k12_e:
-            if os.environ.get("VLLM_SM86_K12_DEBUG"):
-                import traceback
-                print(f"[k12-indexer] fell back to pyref: {_k12_e!r}")
-                traceback.print_exc()
+            # Latch off permanently so we don't pay the exception cost per call;
+            # the rest of the run uses the pyref cleanly.
+            _mark_k12_failed()
+            logger.warning(
+                "[k12-indexer] kernel failed (%r); disabling for this process, "
+                "using the pyref. Free GPU headroom (e.g. "
+                "--gpu-memory-utilization 0.90) to use it.", _k12_e,
+            )
         return _fp8_paged_mqa_logits_pyref(
             q_values, kv_cache, weights, context_lens,
             block_tables, max_model_len, clean_logits,
