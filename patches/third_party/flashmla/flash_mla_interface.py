@@ -410,6 +410,91 @@ def _flash_mla_prefill_pyref(
       max_logits: [s_q, h_q] float32
       lse:        [s_q, h_q] float32
     """
+    # Per-token Python loop: correct but interpreter/launch-bound. For prefill
+    # (s_q up to the chunk size, e.g. 4096) this serializes thousands of tiny
+    # kernels per sparse layer and starves the GPU -> the TTFT bottleneck. Kept
+    # as the parity reference and an opt-out fallback (VLLM_SM86_PREFILL_LOOP=1).
+    if os.environ.get("VLLM_SM86_PREFILL_LOOP", "").strip() in ("1", "true", "True"):
+        return _flash_mla_prefill_pyref_loop(
+            q, kv, indices, sm_scale, d_v, attn_sink, topk_length, out
+        )
+
+    s_q, h_q, d_qk = q.shape
+    s_kv, h_kv = kv.shape[0], kv.shape[1]
+    assert h_kv == 1, "MLA: h_kv must be 1"
+    if out is None:
+        out = torch.empty(s_q, h_q, d_v, dtype=q.dtype, device=q.device)
+    max_logits = torch.zeros(s_q, h_q, dtype=torch.float32, device=q.device)
+    lse = torch.zeros(s_q, h_q, dtype=torch.float32, device=q.device)
+    sink = attn_sink.to(torch.float32) if attn_sink is not None else None
+
+    if s_q == 0:
+        return out, max_logits, lse
+
+    kv2 = kv[:, 0, :]                       # [s_kv, d_qk] bf16
+    idx_all = indices[:, 0, :].long()       # [s_q, topk]
+    topk = idx_all.shape[1]
+    common = min(d_qk, kv2.shape[-1])
+
+    # Per-(token, slot) validity. Slots >= topk_length[t] are dropped (mirrors
+    # the loop's idx[:valid_n] slice); negative / out-of-range indices are
+    # invalid. One boolean grid replaces the per-token variable-length slice.
+    valid = (idx_all >= 0) & (idx_all < s_kv)            # [s_q, topk]
+    if topk_length is not None:
+        slot = torch.arange(topk, device=q.device).unsqueeze(0)   # [1, topk]
+        valid &= slot < topk_length.to(torch.long).unsqueeze(1)
+    safe_idx = torch.where(valid, idx_all, torch.zeros_like(idx_all))
+
+    # Tile over query tokens: the [BT, topk, d_qk] K gather is the memory peak
+    # (full 4k chunk * 512 * 576 * 2B ~ 2.4 GB), so cap it. Within a tile the
+    # work is one batched bf16 tensor-core bmm -> no per-token Python dispatch.
+    BT = int(os.environ.get("VLLM_SM86_PREFILL_BLOCK_T", "256"))
+    neg_inf = float("-inf")
+    for t0 in range(0, s_q, BT):
+        t1 = min(t0 + BT, s_q)
+        v_blk = valid[t0:t1]                              # [bt, topk]
+        K = kv2[safe_idx[t0:t1]]                          # [bt, topk, d_qk] bf16
+        K = K * v_blk.unsqueeze(-1).to(K.dtype)           # zero invalid rows
+        q_blk = q[t0:t1].to(torch.bfloat16)             # [bt, h_q, d_qk]
+        # bf16 tensor-core bmm, fp32 accum -> fp32 logits [bt, h_q, topk]
+        logits = torch.matmul(
+            q_blk[..., :common], K[..., :common].transpose(-1, -2)
+        ).to(torch.float32) * sm_scale
+        logits = logits.masked_fill(~v_blk.unsqueeze(1), neg_inf)
+        max_l = logits.amax(dim=-1)                       # [bt, h_q]
+        max_l_safe = torch.where(
+            torch.isinf(max_l), torch.zeros_like(max_l), max_l
+        )
+        exp_logits = (logits - max_l_safe.unsqueeze(-1)).exp()
+        denom = exp_logits.sum(dim=-1)                    # [bt, h_q]
+        probs = (exp_logits / denom.unsqueeze(-1)).to(torch.bfloat16)
+        V = K[..., :d_v]                                  # [bt, topk, d_v]
+        out_blk = torch.matmul(probs, V).to(out.dtype)    # [bt, h_q, d_v]
+        # attn_sink rescale: out *= exp(lse) / (exp(lse) + exp(attn_sink))
+        lse_blk = max_l_safe + denom.log()
+        if sink is not None:
+            sink_h = sink.view(h_q).unsqueeze(0)          # [1, h_q]
+            scale = (lse_blk.exp() / (lse_blk.exp() + sink_h.exp())).to(out.dtype)
+            out_blk = out_blk * scale.unsqueeze(-1)
+        out[t0:t1].copy_(out_blk)
+        max_logits[t0:t1] = max_l_safe
+        lse[t0:t1] = lse_blk
+
+    return out, max_logits, lse
+
+
+def _flash_mla_prefill_pyref_loop(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+    attn_sink: Optional[torch.Tensor],
+    topk_length: Optional[torch.Tensor],
+    out: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-token reference for sparse-prefill FlashMLA (parity ground truth for
+    the vectorized path; retained as VLLM_SM86_PREFILL_LOOP=1 fallback)."""
     s_q, h_q, d_qk = q.shape
     s_kv, h_kv = kv.shape[0], kv.shape[1]
     assert h_kv == 1, "MLA: h_kv must be 1"

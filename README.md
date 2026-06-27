@@ -72,6 +72,9 @@ The pyref paths auto-activate when `torch.cuda.get_device_capability() < (9, 0)`
 | `VLLM_SM86_K11` | `0` | `1` enable OLD single-program fused FlashMLA decode (superseded by K13; single-program grid uses 1-4 SMs and loses to cuBLAS -- kept for reference) |
 | `VLLM_SM86_K12` | `1` | `0` disable the fused bf16 paged-MQA logits (indexer) kernel. bf16 tensor-core dot (fp32 accumulate, fp32 dequant scale): 4.40x over the pyref at the real H=64 serve shape, and marginally MORE faithful than the pyref (top-512 overlap vs the fp32-true ranking >= pyref). +2% E2E on top of K13 (4.51 -> 4.61). A profiling-time warm-up loads the CUDA module before the KV cache packs the GPU (fixes the prior first-call OOM), and a failure-latch degrades cleanly to the pyref. ON by default. |
 | `VLLM_SM86_K13` | `1` | `0` disable the split-K (FlashDecoding) FlashMLA decode kernel. K13 is the realized split-K rework of K11: partial-state kernel over (B, H-tile, K-split) + log-sum-exp combine, filling the SMs. **3.1x over pyref at the TP=8 serve shape (460->148 us/call), +17% E2E decode (3.84 -> 4.51 tok/s)**, bf16 ULP parity. ON by default. |
+| `VLLM_SM86_PREFILL_LOOP` | `0` | `1` force the OLD per-token Python loop for sparse-MLA prefill (parity reference / fallback). The default path is the vectorized batched bf16 bmm: ~62x over the loop in isolation, **6.9-10.2x E2E TTFT** (2048-token prompt: 52.2 -> 5.2 s). |
+| `VLLM_SM86_PREFILL_BLOCK_T` | `256` | Query-tile size for the vectorized MLA prefill; caps the `[BT, topk, d_qk]` gather footprint. Lower if prefill OOMs under a tight gpu-mem-util. |
+| `VLLM_SM86_INDEXER_TILE_ELEMS` | `24000000` | Element budget for the indexer prefill logits tile. The ref tiles over query rows so `H*BM*N` stays under this, bounding the `[M,H,N]` transient (un-tiled it was multi-GB and OOM-crashed the engine at >~1.5k-token prefills). |
 | `VLLM_MXFP4_USE_MARLIN` | required `1` | Wrapper sets this. Marlin is the only MoE backend that supports `kMxfp4Static` below SM90 (DeepGEMM FP4 needs SM100+, TRTLLM needs SM90+) |
 
 ## What's patched
@@ -153,6 +156,26 @@ With PIECEWISE capture: 1.67 -> 2.6 tok/s (+55%).
 
 K8/K9 (compressor) Triton ports were attempted and reverted: bit-exact parity but 44% E2E regression because per-token launch overhead dominates when most tokens early-exit on the compress_ratio condition. The reference Triton code is preserved in-file but dispatch points back to the pyref.
 
+## Prefill / TTFT (vectorized sparse-MLA + tiled indexer)
+
+Decode and prefill are different regimes. Decode processes one token per step, so a Python loop over the single query token is fine -- that path is the K13/K12 kernels above. Prefill processes the whole prompt at once (up to the chunked-prefill chunk size), and the SM86 sparse-MLA reference looped **per prompt token** (`for t in range(s_q)` in `_flash_mla_prefill_pyref`), launching ~6 tiny CUDA kernels per token per sparse layer. For a 2048-token chunk x 41 sparse layers that is ~168k serialized launches: the GPU is starved by host dispatch, and it dominated TTFT.
+
+Two fixes, both default ON, both pure-PyTorch (no JIT, no module to load):
+
+- **Vectorized MLA prefill** (`flash_mla_interface.py`): the rectangular index structure (`indices: [s_q, 1, topk]`, fixed `topk` with masked slots) collapses the per-token loop into one batched gather + two bf16 tensor-core bmms (fp32 accumulate), tiled over query rows (`BLOCK_T=256`) to bound the gather footprint. **~62x over the loop in isolation** (s_q=2048: 1155 -> 18 ms per sparse layer), bf16-ULP parity vs the loop (retained as `VLLM_SM86_PREFILL_LOOP=1`). Harness: `test_prefill.py`.
+- **Tiled indexer prefill** (`deep_gemm.py`, `_fp8_mqa_logits_pyref`): the logits ref was already vectorized but materialized the full `[M, H, N]` scores plus two fp32 copies (~6.4 GB at M=2048/N=8192). Un-tiled, it OOM-crashed a TP worker (-> engine death) at any prefill above ~1.5k tokens. Now tiled over query rows with an adaptive block sized against `H*N` (self-shrinks as the context N grows toward max-model-len): **307 MB transient** at the former crash shape, **bitwise-identical** output. Harness: `test_indexer_prefill.py`.
+
+E2E TTFT (8x RTX 3080, INT4 AutoRound, gpu-mem-util 0.95, greedy), per-token loop vs vectorized -- both with the tiled indexer, decode unchanged at ~4.6 tok/s:
+
+| Prompt tokens | TTFT before (loop) | TTFT after (vec) | Speedup |
+| --- | --- | --- | --- |
+| 256  | 13.1 s | 1.9 s | 6.9x |
+| 1024 | 42.8 s | 4.2 s | 10.2x |
+| 2048 | 52.2 s | 5.2 s | 10.1x |
+| 3500 | OOM-crash* | 7.5 s | -- |
+
+*Before the indexer-tiling fix, prefills above ~1.5k tokens crash the engine; the tiling fix is what makes long-context prefill work at all on SM86. The MLA vectorization is the speed win on top. A/B note: the loop and vectorized paths produce identical generations (same greedy output, same in-context recall) -- the change moves only wall-clock, not behavior.
+
 ## PIECEWISE cudagraph fix
 
 The repo ships PIECEWISE compile + capture as the default mode (configured in `wrapper-vllm-deepseek.sh`). Capture works because `per_token_group_quant_fp8_sm86` (and its packed-deepgemm sibling) now route their `(data, scale)` outputs through a shape-keyed persistent buffer cache.
@@ -167,7 +190,7 @@ Eager-mode behavior is unaffected (the cache reuse is harmless when capture is o
 
 - **FP4 indexer cache path** raises `NotImplementedError`. Don't pass `--attention_config.use_fp4_indexer_cache=True`.
 - **Q/K dim mismatch** (576 vs 512) handled via prefix dot product; trailing 64 q_pe rope dims dropped. Approximate but coherent in practice.
-- **Long-context prefill** is bounded by per-call vectorized work, not per-token. Still slower than tuned kernels.
+- **Long-context prefill** runs vectorized batched GPU work (one gather + batched bf16 bmm per sparse layer; indexer logits tiled over query rows), not a per-token loop -- 6.9-10.2x faster TTFT than the old loop. Still above a fully-fused Triton kernel since it materializes the gather. See [Prefill / TTFT](#prefill--ttft-vectorized-sparse-mla--tiled-indexer).
 - **Marlin MoE** is the SM86 fallback for FP4 expert weights. Non-standard MXFP4 layouts will break it.
 
 ## Why this exists

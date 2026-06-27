@@ -479,17 +479,31 @@ def _fp8_mqa_logits_pyref(
     N = k_packed.shape[0]
     # Tensor-core matmul in BF16 (Ampere). FP8→BF16 cast is exact (FP8 has
     # 4-bit mantissa, BF16 has 7), and per-K scale fits BF16 dynamic range.
-    q_bf = q_values.to(torch.bfloat16)
+    # K dequant is shared across all query tiles.
     k_bf = k_packed.to(torch.bfloat16) * k_scales.to(torch.bfloat16).unsqueeze(-1)
-    scores = torch.einsum("mhd,nd->mhn", q_bf, k_bf)
-    # Reduction across H needs FP32 for stability of weighted sum.
-    logits = (weights.to(torch.float32).unsqueeze(-1) * scores.to(torch.float32)).sum(dim=1)
-    n_idx = torch.arange(N, device=logits.device, dtype=cu_seqlen_ks.dtype)
-    valid = (n_idx.unsqueeze(0) >= cu_seqlen_ks.unsqueeze(1)) & (
-        n_idx.unsqueeze(0) < cu_seqlen_ke.unsqueeze(1)
-    )
+    out = torch.empty(M, N, dtype=torch.float32, device=q_values.device)
+    n_idx = torch.arange(N, device=q_values.device, dtype=cu_seqlen_ks.dtype)
     fill = float("-inf") if clean_logits else 0.0
-    return torch.where(valid, logits, torch.full_like(logits, fill))
+    # Tile over query rows. The per-tile scores tensor is [BM, H, N]; without
+    # tiling the full [M, H, N] (plus its fp32 copy for the H-reduction) is
+    # multi-GB for a prefill chunk and OOMs at gpu-memory-utilization 0.95
+    # (observed: crashes a TP worker -> engine death). BM is sized so H*BM*N
+    # stays under a fixed element budget, so it self-shrinks as the context N
+    # grows toward max-model-len. Numerics match the untiled path exactly.
+    budget = int(os.environ.get("VLLM_SM86_INDEXER_TILE_ELEMS", str(24_000_000)))
+    BM = max(1, min(M, budget // max(1, H * N)))
+    for m0 in range(0, M, BM):
+        m1 = min(m0 + BM, M)
+        q_bf = q_values[m0:m1].to(torch.bfloat16)              # [bm, H, D]
+        scores = torch.einsum("mhd,nd->mhn", q_bf, k_bf)       # [bm, H, N] bf16
+        # Reduction across H needs FP32 for stability of the weighted sum.
+        logits = (weights[m0:m1].to(torch.float32).unsqueeze(-1)
+                  * scores.to(torch.float32)).sum(dim=1)        # [bm, N] f32
+        valid = (n_idx.unsqueeze(0) >= cu_seqlen_ks[m0:m1].unsqueeze(1)) & (
+            n_idx.unsqueeze(0) < cu_seqlen_ke[m0:m1].unsqueeze(1)
+        )
+        out[m0:m1] = torch.where(valid, logits, torch.full_like(logits, fill))
+    return out
 
 
 def fp8_fp4_mqa_logits(
