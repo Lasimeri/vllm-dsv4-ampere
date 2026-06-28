@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve Intel/DeepSeek-V4-Flash-W4A16-AutoRound on 8x RTX 3080 (SM86) using the
+# Serve deepseek-ai/DeepSeek-V4-Flash (FP8/MXFP4) on 8x RTX 3080 (SM86) using the
 # vllm-dsv4-ampere SM86 pyref/Triton patch set on vLLM base c2fb0133.
 # Adapted from vllm-dsv4-ampere/wrapper-vllm-deepseek.sh (model + paths swapped).
 set -euo pipefail
@@ -42,7 +42,10 @@ export CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
 export VLLM_TORCH_PROFILER_DIR=/home/lasimeri/vllm-sm86/prof
 
 VLLM=/home/lasimeri/vllm-sm86/.venv/bin/vllm
-MODEL="${MODEL_PATH:-Intel/DeepSeek-V4-Flash-W4A16-AutoRound}"
+# Default is the original deepseek-ai checkpoint (FP8 MLA attn + MXFP4 experts),
+# NOT the Intel W4A16 AutoRound. is_bmm Marlin bypass in fp8.py makes wo_a load
+# on SM86. Override with MODEL_PATH=Intel/DeepSeek-V4-Flash-W4A16-AutoRound.
+MODEL="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
 
 exec "$VLLM" serve "$MODEL" \
   --served-model-name DeepSeek-V4-Flash \

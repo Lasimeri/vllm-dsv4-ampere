@@ -21,7 +21,7 @@ export VLLM_SM86_K13="${VLLM_SM86_K13:-1}"
 export VLLM_SM86_K12="${VLLM_SM86_K12:-1}"
 
 VLLM=/home/lasimeri/vllm-sm86/.venv/bin/vllm
-MODEL="${MODEL_PATH:-Intel/DeepSeek-V4-Flash-W4A16-AutoRound}"
+MODEL="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
 SPEC_TOK="${SPEC_TOK:-1}"
 # GPU mem util is lower than the base script: the MTP head weights + draft KV
 # cache need headroom on top of the already-tight 0.95.
