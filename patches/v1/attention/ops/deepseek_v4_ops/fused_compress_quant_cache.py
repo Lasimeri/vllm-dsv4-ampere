@@ -1184,7 +1184,18 @@ def _fused_kv_compress_indexer_attn_sm86_triton(
 # PIECEWISE cudagraph capture splits at these boundaries. Bodies use
 # .nonzero() / boolean masking which is forbidden during cudagraph capture.
 try:
+    import os as _os
+
     from vllm.utils.torch_utils import direct_register_custom_op
+
+    # FULL cudagraph capture forbids the pyref's .nonzero(). For small
+    # (decode / cudagraph-captured) batches, dispatch to the Triton compressor,
+    # which does fixed-grid predicated per-token masked stores (capture-safe).
+    # The Triton path is avoided only for large prefill batches, where the
+    # per-token launch overhead loses to the nonzero-batched pyref.
+    _COMPRESS_TRITON_MAX_TOKENS = int(
+        _os.environ.get("VLLM_SM86_COMPRESS_TRITON_MAX", "64")
+    )
 
     def _compress_sparse_attn_sm86_op(
         state_cache: torch.Tensor,
@@ -1209,28 +1220,45 @@ try:
         token_stride: int,
         scale_dim: int,
     ) -> None:
-        # NOTE: Triton variant (_fused_kv_compress_sparse_attn_sm86_triton)
-        # exists below but causes ~44% E2E regression because per-token
-        # kernel launches dominate when compress_ratio is large (most
-        # tokens early-exit). Pyref's batched-via-nonzero approach wins
-        # here. Future: write a BATCHED Triton kernel processing only
-        # emit tokens. Until then, dispatch through pyref.
-        _fused_kv_compress_sparse_attn_pyref(
-            state_cache, token_to_req_indices, positions, slot_mapping,
-            block_table, block_size,
-            rms_norm_weight, rms_norm_eps,
-            cos_sin_cache,
-            k_cache, kv_slot_mapping, kv_cache_block_size,
-            head_size=head_size,
-            state_width=state_width,
-            compress_ratio=compress_ratio,
-            overlap=overlap,
-            rope_head_dim=rope_head_dim,
-            fp8_max=fp8_max,
-            quant_block=quant_block,
-            token_stride=token_stride,
-            scale_dim=scale_dim,
-        )
+        # Small (decode / cudagraph-captured) batches: the Triton kernel does
+        # predicated per-token masked stores (no .nonzero()), so FULL cudagraph
+        # capture works and the per-token launch overhead is negligible. Large
+        # (prefill) batches: the nonzero-batched pyref wins (the Triton path
+        # there regresses ~44% as most tokens early-exit).
+        if slot_mapping.shape[0] <= _COMPRESS_TRITON_MAX_TOKENS:
+            _fused_kv_compress_sparse_attn_sm86_triton(
+                state_cache, token_to_req_indices, positions, slot_mapping,
+                block_table, block_size,
+                rms_norm_weight, rms_norm_eps,
+                cos_sin_cache,
+                k_cache, kv_slot_mapping, kv_cache_block_size,
+                head_size=head_size,
+                state_width=state_width,
+                compress_ratio=compress_ratio,
+                overlap=overlap,
+                rope_head_dim=rope_head_dim,
+                fp8_max=fp8_max,
+                quant_block=quant_block,
+                token_stride=token_stride,
+                scale_dim=scale_dim,
+            )
+        else:
+            _fused_kv_compress_sparse_attn_pyref(
+                state_cache, token_to_req_indices, positions, slot_mapping,
+                block_table, block_size,
+                rms_norm_weight, rms_norm_eps,
+                cos_sin_cache,
+                k_cache, kv_slot_mapping, kv_cache_block_size,
+                head_size=head_size,
+                state_width=state_width,
+                compress_ratio=compress_ratio,
+                overlap=overlap,
+                rope_head_dim=rope_head_dim,
+                fp8_max=fp8_max,
+                quant_block=quant_block,
+                token_stride=token_stride,
+                scale_dim=scale_dim,
+            )
 
     def _compress_sparse_attn_sm86_op_fake(*args, **kwargs) -> None:
         return None
@@ -1265,23 +1293,42 @@ try:
         token_stride: int,
         scale_dim: int,
     ) -> None:
-        # See note on sparse_attn op above; same regression pattern.
-        _fused_kv_compress_indexer_attn_pyref(
-            state_cache, token_to_req_indices, positions, slot_mapping,
-            block_table, block_size,
-            rms_norm_weight, rms_norm_eps,
-            cos_sin_cache,
-            k_cache, kv_slot_mapping, kv_cache_block_size,
-            head_size=head_size,
-            state_width=state_width,
-            compress_ratio=compress_ratio,
-            overlap=overlap,
-            rope_head_dim=rope_head_dim,
-            fp8_max=fp8_max,
-            quant_block=quant_block,
-            token_stride=token_stride,
-            scale_dim=scale_dim,
-        )
+        # See sparse_attn op above: Triton (capture-safe, predicated stores) for
+        # small decode/captured batches; nonzero pyref for large prefill batches.
+        if slot_mapping.shape[0] <= _COMPRESS_TRITON_MAX_TOKENS:
+            _fused_kv_compress_indexer_attn_sm86_triton(
+                state_cache, token_to_req_indices, positions, slot_mapping,
+                block_table, block_size,
+                rms_norm_weight, rms_norm_eps,
+                cos_sin_cache,
+                k_cache, kv_slot_mapping, kv_cache_block_size,
+                head_size=head_size,
+                state_width=state_width,
+                compress_ratio=compress_ratio,
+                overlap=overlap,
+                rope_head_dim=rope_head_dim,
+                fp8_max=fp8_max,
+                quant_block=quant_block,
+                token_stride=token_stride,
+                scale_dim=scale_dim,
+            )
+        else:
+            _fused_kv_compress_indexer_attn_pyref(
+                state_cache, token_to_req_indices, positions, slot_mapping,
+                block_table, block_size,
+                rms_norm_weight, rms_norm_eps,
+                cos_sin_cache,
+                k_cache, kv_slot_mapping, kv_cache_block_size,
+                head_size=head_size,
+                state_width=state_width,
+                compress_ratio=compress_ratio,
+                overlap=overlap,
+                rope_head_dim=rope_head_dim,
+                fp8_max=fp8_max,
+                quant_block=quant_block,
+                token_stride=token_stride,
+                scale_dim=scale_dim,
+            )
 
     def _compress_indexer_attn_sm86_op_fake(*args, **kwargs) -> None:
         return None

@@ -2,7 +2,7 @@
 
 Patches that let **DeepSeek-V4-Flash** run on **Ampere SM 8.6** GPUs (RTX 30xx) under vLLM.
 
-Status: **working with PIECEWISE cudagraph capture**. Generates coherent text, follows instructions, emits valid OpenAI-compatible tool calls. Decode at short context on 8x RTX 3080 20GB: **4.61 tok/s** on `int4-autoround-support` (Intel INT4 AutoRound + K12 + K13), **2.6 tok/s** on `master` (deepseek-ai FP4+FP8). See the [Branches](#branches) table for the per-branch breakdown. Eager-mode fallback on `master` runs at ~2.01 tok/s.
+Status: **working with FULL decode cudagraph capture**. Generates coherent text, follows instructions, emits valid OpenAI-compatible tool calls. Decode at short context on 8x RTX 3080 20GB: **5.89 tok/s** on `int4-autoround-support` (Intel INT4 AutoRound + K12 + K13 + FULL decode capture), **5.87 tok/s** on the deepseek-ai FP4+FP8 checkpoint (now loadable here, see [FP8 support](#fp8-mxfp4-checkpoint-support)). FULL decode cudagraph capture adds **+28%** over the prior PIECEWISE 4.61 (see [FULL decode capture](#full-decode-cudagraph-capture)). See the [Branches](#branches) table for the breakdown.
 
 This is a starting point for the community. Upstream vLLM rejects FP8/sparse-MLA/DeepGEMM support on SM<90 ("SM80 support better lives in a fork", per @youkaichao on PR #40906). This repo replaces every blocking kernel with either a pure-PyTorch reference path or a hand-written SM86 Triton kernel that engages BF16 tensor cores.
 
@@ -14,7 +14,7 @@ All branches target 8x RTX 3080 20GB (SM 8.6), TP=8, PIECEWISE cudagraph capture
 | --- | --- | --- | --- | --- |
 | `master` | `deepseek-ai/DeepSeek-V4-Flash` (FP4 + FP8) | main @ 2026-04-27 (PR #40860), pinned `0.1.dev15830+g8d599d76a` | **2.6** PIECEWISE / 2.01 eager | Original SM86 patch set: pyref + K6/K7/K10 Triton kernels. |
 | `compat/vllm-0.20.1` | `deepseek-ai/DeepSeek-V4-Flash` | `vllm==0.20.1` (PyPI) | not yet E2E-validated | Patches apply cleanly + all `torch.ops.vllm.*` ops register; full inference unverified (see issue #3). |
-| `int4-autoround-support` | `Intel/DeepSeek-V4-Flash-W4A16-AutoRound` (INT4 W4A16) | main @ `c2fb0133` (2026-04-30), clang build | **4.61** PIECEWISE (3.84 baseline) | INT4 AutoRound model: routed experts run the hardware Marlin int4 kernel; adds the K13 split-K FlashMLA decode (+17%) and the K12 bf16 indexer kernel (+2%). This is the current development branch. |
+| `int4-autoround-support` | `Intel/DeepSeek-V4-Flash-W4A16-AutoRound` (INT4 W4A16) | main @ `c2fb0133` (2026-04-30), clang build | **5.89** FULL-decode-capture (4.61 PIECEWISE, 3.84 pyref baseline) | INT4 AutoRound model: routed experts run the hardware Marlin int4 kernel; K13 split-K FlashMLA decode + K12 bf16 indexer kernel; FULL decode cudagraph capture (+28% over PIECEWISE). Current development branch. |
 
 The **int4-autoround-support** branch is the fastest because (a) the AutoRound experts use hardware Marlin int4 (no software dequant) and (b) the K13 split-K FlashMLA decode + K12 bf16 indexer kernels fill the SMs at the TP=8 decode shape (3.84 -> 4.51 -> 4.61, +20% total). The remaining decode floor on every branch is the sparse-MLA/indexer dequant + softmax, which has no native Ampere kernel.
 
@@ -72,6 +72,9 @@ The pyref paths auto-activate when `torch.cuda.get_device_capability() < (9, 0)`
 | `VLLM_SM86_K11` | `0` | `1` enable OLD single-program fused FlashMLA decode (superseded by K13; single-program grid uses 1-4 SMs and loses to cuBLAS -- kept for reference) |
 | `VLLM_SM86_K12` | `1` | `0` disable the fused bf16 paged-MQA logits (indexer) kernel. bf16 tensor-core dot (fp32 accumulate, fp32 dequant scale): 4.40x over the pyref at the real H=64 serve shape, and marginally MORE faithful than the pyref (top-512 overlap vs the fp32-true ranking >= pyref). +2% E2E on top of K13 (4.51 -> 4.61). A profiling-time warm-up loads the CUDA module before the KV cache packs the GPU (fixes the prior first-call OOM), and a failure-latch degrades cleanly to the pyref. ON by default. |
 | `VLLM_SM86_K13` | `1` | `0` disable the split-K (FlashDecoding) FlashMLA decode kernel. K13 is the realized split-K rework of K11: partial-state kernel over (B, H-tile, K-split) + log-sum-exp combine, filling the SMs. **3.1x over pyref at the TP=8 serve shape (460->148 us/call), +17% E2E decode (3.84 -> 4.51 tok/s)**, bf16 ULP parity. ON by default. |
+| `VLLM_SM86_NO_MULTISTREAM` | `1` | `0` re-enable the attention multi-stream input-GEMM overlap. Default OFF (single stream): at batch=1 those GEMMs don't overlap, and the cross-stream CUDA events block FULL cudagraph capture. Required for FULL decode capture. |
+| `CG_MODE` (serve script) | `FULL_DECODE_ONLY` | `PIECEWISE` reverts to piecewise capture. FULL_DECODE_ONLY captures the whole decode forward as one graph: **+28% decode tok/s** (4.61 -> 5.89). Needs `VLLM_SM86_NO_MULTISTREAM=1` + the compressor capture-safe dispatch (both default ON). |
+| `VLLM_SM86_COMPRESS_TRITON_MAX` | `64` | Token-count threshold below which the KV compressor uses the capture-safe Triton kernel (predicated masked stores, no `.nonzero()`) instead of the nonzero-batched pyref. Decode batches (<= this) capture; large prefill batches keep the faster pyref. |
 | `VLLM_SM86_PREFILL_LOOP` | `0` | `1` force the OLD per-token Python loop for sparse-MLA prefill (parity reference / fallback). The default path is the vectorized batched bf16 bmm: ~62x over the loop in isolation, **6.9-10.2x E2E TTFT** (2048-token prompt: 52.2 -> 5.2 s). |
 | `VLLM_SM86_PREFILL_BLOCK_T` | `256` | Query-tile size for the vectorized MLA prefill; caps the `[BT, topk, d_qk]` gather footprint. Lower if prefill OOMs under a tight gpu-mem-util. |
 | `VLLM_SM86_INDEXER_TILE_ELEMS` | `24000000` | Element budget for the indexer prefill logits tile. The ref tiles over query rows so `H*BM*N` stays under this, bounding the `[M,H,N]` transient (un-tiled it was multi-GB and OOM-crashed the engine at >~1.5k-token prefills). |
@@ -228,6 +231,50 @@ would help at batch>1 (verify amortized over sequences). Realizing the FULL-capt
 path would require making the SM86 sparse-attention ops cudagraph-FULL-compatible
 (no cross-stream events, no host syncs) -- a large rewrite, likely infeasible given
 the inherent data-dependence of top-k sparse attention.
+
+## FULL decode cudagraph capture
+
+The biggest decode win after K13/K12: capturing the **entire decode forward** as one
+CUDA graph (`cudagraph_mode=FULL_DECODE_ONLY`) instead of piecewise, eliminating the
+~300 eager op-dispatches per token. **+28% decode tok/s: 4.61 -> 5.89 (INT4),
+4.77 -> 5.87 (FP8)**, coherent on both, default ON.
+
+FULL capture was thought impossible on SM86 (the data-dependent sparse attention).
+It took two enablers, both default ON:
+
+1. **Single-stream attention** (`VLLM_SM86_NO_MULTISTREAM=1`). The attention layer
+   overlapped its input GEMMs (`fused_wqa_wkv`, indexer/compressor projections) across
+   aux CUDA streams via `execute_in_parallel` + cross-stream events. At batch=1 those
+   single-token GEMMs are memory-bound and don't actually overlap, while the cross-stream
+   `event.record()/wait()` are **stream-capture-illegal** (`cudaErrorStreamCaptureUnsupported`).
+   Running single stream removes the events (and a little CPU overhead).
+2. **Capture-safe KV compressor** (`fused_compress_quant_cache.py`). The compressor pyref
+   selected emit tokens with `emit_mask.nonzero()` -- a data-dependent (dynamic-shape) op,
+   capture-illegal. There is already a Triton compressor that does fixed-grid **predicated
+   per-token masked stores** (capture-safe); it was avoided only because per-token launches
+   regress large *prefill* batches. The fix dispatches on token count: small (decode /
+   cudagraph-captured) batches use the Triton kernel; large prefill batches keep the
+   nonzero pyref. Threshold `VLLM_SM86_COMPRESS_TRITON_MAX` (default 64).
+
+The other suspected blockers (`.nonzero()`/`.item()` in `cache_utils.py`) turned out to
+be **prefill-only** -- not on the captured decode path -- and the indexer top-k is
+fixed-size (512). So the compressor was the last one.
+
+MTP note: FULL capture also lets the spec-decode *verify* shape be captured, but MTP is
+still throughput-neutral at batch=1 (5.50 vs 5.87 without it) -- the draft forward + spec
+orchestration overhead cancels the ~1.75x acceptance. The plain FULL-capture decode is the
+win; MTP is not worth it at `max-num-seqs=1`.
+
+## FP8 / MXFP4 checkpoint support
+
+The original `deepseek-ai/DeepSeek-V4-Flash` (FP8 attention + FP4/MXFP4 experts) now loads
+and runs on this build (5.87 tok/s, coherent), where it previously crashed. Root cause: on
+SM86 the fp8 default kernel is **Marlin**, and `Fp8LinearMethod.process_weights_after_loading`
+was Marlin-repacking the MLA `wo_a` (`[1024,4096] -> [256,4096]`, scale transposed). But
+`wo_a` is an `is_bmm` weight consumed by the `deepseek_v4_fp8_einsum` **pyref**, which
+dequantizes the *raw block-fp8* weight itself -- Marlin's repack corrupts the layout the
+einsum reshapes. Fix (`patches/.../quantization/fp8.py`): `is_bmm` fp8 weights bypass Marlin
+and stay raw block-fp8. (The INT4 AutoRound model never hit this -- its `wo_a` is bf16.)
 
 ## PIECEWISE cudagraph fix
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -1238,7 +1239,14 @@ class DeepseekV4Model(nn.Module):
         # DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        # At batch=1 decode these GEMMs are single-token / memory-bound and do
+        # not actually overlap, while the cross-stream CUDA events are a FULL
+        # cudagraph-capture blocker. VLLM_SM86_NO_MULTISTREAM=1 runs single
+        # stream (execute_in_parallel falls back to sequential when None).
+        if os.environ.get("VLLM_SM86_NO_MULTISTREAM", "").strip() in ("1", "true", "True"):
+            aux_stream_list = None
+        else:
+            aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
 
         self.device = current_platform.device_type
         # Reserved topk indices buffer for all Indexer layers to reuse.

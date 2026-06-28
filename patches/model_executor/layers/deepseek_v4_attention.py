@@ -351,8 +351,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         return self.wo_b(z.flatten(1))
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
-        assert self.aux_stream_list is not None
-        assert len(self.aux_stream_list) >= 3
+        # aux_stream_list is None under VLLM_SM86_NO_MULTISTREAM: execute_in_parallel
+        # then runs every fn sequentially on the current stream (no events).
+        assert self.aux_stream_list is None or len(self.aux_stream_list) >= 3
 
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
         # on aux streams 0..2 when their owning module exists. ln_events[0]
@@ -396,7 +397,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             aux_fns,
             self.ln_events[0],
             self.ln_events[1:4],
-            self.aux_stream_list[:3],
+            self.aux_stream_list[:3] if self.aux_stream_list is not None else None,
         )
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
@@ -428,8 +429,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
-            assert self.aux_stream_list is not None
-            aux_stream = self.aux_stream_list[0]
+            aux_stream = (
+                self.aux_stream_list[0] if self.aux_stream_list is not None else None
+            )
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -457,8 +459,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
-            assert self.aux_stream_list is not None
-            aux_stream = self.aux_stream_list[0]
+            aux_stream = (
+                self.aux_stream_list[0] if self.aux_stream_list is not None else None
+            )
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
