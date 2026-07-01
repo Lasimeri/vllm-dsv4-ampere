@@ -204,23 +204,34 @@ def _quantize_and_insert_k_cache_sm86_pyref(
     scale_payload = torch.zeros(Nv, TOKEN_SCALE_DIM, dtype=torch.uint8, device=device)
     scale_payload[:, :N_QUANT_BLOCKS] = scale_encoded
 
-    cache_flat = k_cache.reshape(k_cache.shape[0], -1)
-    block_stride = cache_flat.shape[-1]
-    cache_flat_1d = cache_flat.reshape(-1)
+    # Scatter through the ORIGINAL (possibly non-contiguous / row-padded) view.
+    # A reshape(-1) here silently copies when stride(0) > row bytes, discarding
+    # every write; the Triton path never hits this because it uses raw pointers
+    # with k_cache.stride(0). Advanced indexing on the 2D view writes through
+    # to the base storage regardless of stride(0) padding.
+    cache_2d = k_cache if k_cache.dim() == 2 else k_cache.reshape(k_cache.shape[0], -1)
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") == "1" and not globals().get(
+        "_KINS_DBG"
+    ):
+        globals()["_KINS_DBG"] = True
+        print(
+            f"[KINS_DBG] k_cache shape={tuple(k_cache.shape)} "
+            f"stride={k_cache.stride()} contig={k_cache.is_contiguous()} "
+            f"2d_aliases={cache_2d.data_ptr() == k_cache.data_ptr()}",
+            flush=True,
+        )
     arange_data = torch.arange(TOKEN_DATA_SIZE, device=device)
     arange_scale = torch.arange(TOKEN_SCALE_DIM, device=device)
 
-    data_base = block_idx * block_stride + pos_in_block * TOKEN_DATA_SIZE
-    data_idx = (data_base.unsqueeze(-1) + arange_data).flatten()
-    cache_flat_1d[data_idx] = data_payload.flatten()
+    data_cols = (pos_in_block * TOKEN_DATA_SIZE).unsqueeze(-1) + arange_data
+    cache_2d[block_idx.unsqueeze(-1), data_cols] = data_payload
 
-    scale_base = (
-        block_idx * block_stride
-        + block_size * TOKEN_DATA_SIZE
-        + pos_in_block * TOKEN_SCALE_DIM
-    )
-    scale_idx = (scale_base.unsqueeze(-1) + arange_scale).flatten()
-    cache_flat_1d[scale_idx] = scale_payload.flatten()
+    scale_cols = (
+        block_size * TOKEN_DATA_SIZE + pos_in_block * TOKEN_SCALE_DIM
+    ).unsqueeze(-1) + arange_scale
+    cache_2d[block_idx.unsqueeze(-1), scale_cols] = scale_payload
 
 
 def quantize_and_insert_k_cache(

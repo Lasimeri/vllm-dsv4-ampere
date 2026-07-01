@@ -61,6 +61,69 @@ from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+_NAN_PASS = [0]
+_LOGIT_PROBE_N = [0]
+
+
+def _nan_probe_logits(hidden, logits, lm_head) -> None:
+    """Probe the lm_head/logits path across passes (VLLM_SM86_NAN_PROBE=1).
+
+    NOT one-shot: the first call(s) are the startup warmup/profiling forward
+    (dummy input); the real request forwards come later. Log many calls and
+    match the argmax against the actually-emitted token to find the real one.
+    """
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1" or _LOGIT_PROBE_N[0] >= 60:
+        return
+    call = _LOGIT_PROBE_N[0]
+    _LOGIT_PROBE_N[0] += 1
+
+    def _stat(t):
+        if t is None:
+            return "None"
+        tf = t.detach().float()
+        return (
+            f"nan={bool(torch.isnan(tf).any().item())} "
+            f"inf={bool(torch.isinf(tf).any().item())} "
+            f"absmax={float(tf.abs().amax().item()):.3e} shape={tuple(t.shape)}"
+        )
+
+    if call == 0:
+        w = getattr(lm_head, "weight", None)
+        print(f"[LOGIT_PROBE] lm_head.weight: {_stat(w)} "
+              f"type={type(lm_head).__name__}", flush=True)
+    # last-row logits -> top-6 token ids the sampler will pick from
+    lf = logits.detach().float()
+    row = lf[-1] if lf.dim() == 2 else lf
+    finite = torch.nan_to_num(row, nan=-1e30, posinf=-1e30, neginf=-1e30)
+    top = torch.topk(finite, 6)
+    ids = top.indices.tolist()
+    vals = [round(v, 2) for v in top.values.tolist()]
+    print(f"[LOGIT_PROBE call{call} pass{_NAN_PASS[0]}] logits {_stat(logits)} "
+          f"argmax_ids={ids} vals={vals}", flush=True)
+
+
+def _nan_probe(name: str, x: torch.Tensor) -> None:
+    """Env-gated residual-stream inf/nan probe (VLLM_SM86_NAN_PROBE=1).
+
+    Logs per-module absmax on the FIRST forward pass so the point where
+    magnitude blows up (before it becomes NaN via inf-inf) is visible. Does
+    not raise; the first non-finite module in execution order is the root.
+    """
+    import os
+
+    if os.environ.get("VLLM_SM86_NAN_PROBE") != "1" or _NAN_PASS[0] >= 40:
+        return
+    xf = x.detach().float()
+    amax = float(xf.abs().amax().item()) if xf.numel() else 0.0
+    csum = float(xf.sum().item()) if xf.numel() else 0.0
+    print(
+        f"[NAN_PROBE p{_NAN_PASS[0]} n{x.shape[0]}] {name}: "
+        f"sum={csum:.6e} absmax={amax:.4e}",
+        flush=True,
+    )
+
 
 class DeepseekV4MLP(nn.Module):
     def __init__(
@@ -826,6 +889,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self._probe_l0 = prefix.endswith("layers.0")
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4AmpereAttention(
@@ -952,8 +1016,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
 
+        if self._probe_l0:
+            _nan_probe("L0.pre_attn", x)
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
+        if self._probe_l0:
+            _nan_probe("L0.attn_out", x)
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
@@ -969,8 +1037,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
         )
+        if self._probe_l0:
+            _nan_probe("L0.post_mhc", x)
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
+        if self._probe_l0:
+            _nan_probe("L0.ffn_out", x)
         return x, residual, post_mix, res_mix
 
 
@@ -1112,8 +1184,12 @@ class DeepseekV4Model(nn.Module):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
+        _nan_probe("embed", hidden_states)
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for _li, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1122,10 +1198,12 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            _nan_probe(f"layer{_li}", hidden_states)
         # The fused path defers the final hc_post to the next layer's
         # fused_post_pre. After the last layer we must apply it explicitly.
         if layer is not None:
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
+        _nan_probe("hc_post", hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -1142,7 +1220,10 @@ class DeepseekV4Model(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
+        _nan_probe("hc_head", hidden_states)
         hidden_states = self.norm(hidden_states)
+        _nan_probe("norm", hidden_states)
+        _NAN_PASS[0] += 1
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1340,6 +1421,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        _nan_probe_logits(hidden_states, logits, self.lm_head)
         return logits
 
     def forward(

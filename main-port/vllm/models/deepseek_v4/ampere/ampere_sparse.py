@@ -24,6 +24,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
 )
 from vllm.models.deepseek_v4.ampere.ampere_sparse_decode_fp8 import (
     ampere_sparse_decode_fp8,
+    apply_attn_sink,
 )
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -247,6 +248,21 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens
         gather_lens = swa_metadata.prefill_gather_lens
+
+        import os
+
+        if (
+            os.environ.get("VLLM_SM86_NAN_PROBE") == "1"
+            and self.prefix.endswith("layers.0.attn")
+        ):
+            bt = swa_metadata.block_table[num_decodes:]
+            print(
+                f"[SWA_META] seq_lens={seq_lens.tolist() if seq_lens is not None else None} "
+                f"gather_lens={gather_lens.tolist() if gather_lens is not None else None} "
+                f"block_table_row0={bt[0, :6].tolist() if bt.numel() else '?'} "
+                f"slot_map[:8]={swa_metadata.slot_mapping[:8].tolist()}",
+                flush=True,
+            )
         assert seq_lens is not None
         assert gather_lens is not None
 
@@ -335,7 +351,7 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             )
 
             kv_ws = kv[:chunk_size].reshape(-1, 1, q.shape[-1])
-            out, _, _ = triton_bf16_mla_sparse_interface(
+            out, _, lse = triton_bf16_mla_sparse_interface(
                 q=q[query_start:query_end],
                 kv=kv_ws,
                 indices=combined_indices.unsqueeze(1),
@@ -343,4 +359,6 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
                 d_v=q.shape[-1],
                 block_dpe=0,
             )
-            output[query_start:query_end] = out
+            output[query_start:query_end] = apply_attn_sink(
+                out, lse, self.attn_sink
+            )

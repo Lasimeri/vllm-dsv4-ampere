@@ -121,6 +121,33 @@ def _dequant_gather_slots_kernel(
         tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
 
 
+def apply_attn_sink(
+    out: torch.Tensor,  # [T, H, Dv]
+    lse: torch.Tensor,  # [T, H] natural-log logsumexp from the BF16 kernel
+    attn_sink: torch.Tensor,  # [H] (or padded) learned per-head sink logit
+) -> torch.Tensor:
+    """Fold the learned per-head attention sink into a sink-less kernel output.
+
+    ``triton_bf16_mla_sparse_interface`` has no sink slot; the DeepSeek-V4 sink
+    is a per-head logit that contributes ``exp(s_h - LSE)`` to the softmax
+    denominator with no value vector. Correct post-hoc:
+    ``out' = out / (1 + exp(s_h - LSE))``, broadcast per (token, head) over the
+    value dim. ``attn_sink`` shares the scaled-logit units of ``LSE``; padded or
+    ``-inf`` sinks are inert (``exp -> 0`` leaves the row unchanged).
+    """
+    import os
+
+    if os.environ.get("VLLM_SM86_SINK", "1") != "1":
+        return out
+    sink = attn_sink[: out.shape[1]].to(lse.dtype)
+    delta = sink.unsqueeze(0) - lse
+    # -inf sink and/or -inf LSE (empty row) can yield inf-inf = NaN; treat any
+    # non-finite delta as -inf so exp(delta)=0 leaves the row unchanged.
+    delta = torch.where(torch.isfinite(delta), delta, torch.full_like(delta, float("-inf")))
+    denom = 1.0 + torch.exp(delta)
+    return out / denom.unsqueeze(-1)
+
+
 def dequant_gather_slots(
     out: torch.Tensor,  # [total_slots, 512] bf16, pre-allocated
     cache: torch.Tensor,  # [num_blocks, block_size, head_bytes] uint8
@@ -288,7 +315,7 @@ def ampere_sparse_decode_fp8(
         )
 
     # Call BF16 sparse MLA kernel
-    out_attn, _, _ = triton_bf16_mla_sparse_interface(
+    out_attn, _, lse = triton_bf16_mla_sparse_interface(
         q=q,
         kv=workspace.unsqueeze(1),
         indices=combined_indices.unsqueeze(1),
@@ -296,4 +323,4 @@ def ampere_sparse_decode_fp8(
         d_v=q.shape[-1],
         block_dpe=0,
     )
-    out.copy_(out_attn)
+    out.copy_(apply_attn_sink(out_attn, lse, attn_sink))

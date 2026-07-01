@@ -41,8 +41,12 @@ def _fp8_mqa_logits_pyref(
         m1 = min(m0 + BM, M)
         q_bf = q_values[m0:m1].to(torch.bfloat16)
         scores = torch.einsum("mhd,nd->mhn", q_bf, k_bf)
+        # Lightning indexer: per-head ReLU before the weighted head-sum, matching
+        # deep_gemm fmaxf(accum, 0). k_scale (>0) is folded into k_bf, so
+        # relu(scale*x) == scale*relu(x); clamp on scores is equivalent.
         logits = (
-            weights[m0:m1].to(torch.float32).unsqueeze(-1) * scores.to(torch.float32)
+            weights[m0:m1].to(torch.float32).unsqueeze(-1)
+            * scores.to(torch.float32).clamp_min(0.0)
         ).sum(dim=1)
         valid = (n_idx.unsqueeze(0) >= cu_seqlen_ks[m0:m1].unsqueeze(1)) & (
             n_idx.unsqueeze(0) < cu_seqlen_ke[m0:m1].unsqueeze(1)
@@ -98,7 +102,8 @@ def _fp8_paged_mqa_logits_pyref(
         m_end = m_start + next_n
         scores = torch.einsum("mhd,nd->mhn", q_bf[m_start:m_end], k_bf)
         w_b = weights[m_start:m_end].to(torch.float32)
+        # Per-head ReLU before weighted head-sum (deep_gemm fmaxf(accum, 0)).
         logits[m_start:m_end, :ctx] = (
-            w_b.unsqueeze(-1) * scores.to(torch.float32)
+            w_b.unsqueeze(-1) * scores.to(torch.float32).clamp_min(0.0)
         ).sum(dim=1)
     return logits
