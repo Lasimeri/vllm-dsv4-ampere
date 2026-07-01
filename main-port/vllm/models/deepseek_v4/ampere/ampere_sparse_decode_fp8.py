@@ -88,10 +88,19 @@ def _dequant_gather_slots_kernel(
         offsets = qblock_start + tl.arange(0, quant_block)
         mask = offsets < fp8_dim
 
-        # Load FP8 as uint8 and bitcast
+        # Load FP8 e4m3fn bytes. SM8x Triton cannot bitcast to fp8e4nv, so
+        # decode the e4m3fn format manually (sign.4-bit exp.3-bit mantissa,
+        # bias 7): normal = (1 + m/8) * 2^(e-7); subnormal (e==0) = m/8 * 2^-6.
         x_uint8 = tl.load(token_data_ptr + offsets, mask=mask, other=0)
-        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        x_float = x_fp8.to(tl.float32)
+        xi = x_uint8.to(tl.int32)
+        sign = (xi >> 7) & 1
+        exp = (xi >> 3) & 0xF
+        mant = (xi & 0x7).to(tl.float32)
+        normal = (1.0 + mant * 0.125) * tl.exp2(exp.to(tl.float32) - 7.0)
+        subnorm = mant * 0.125 * tl.exp2(-6.0)
+        x_float = tl.where(exp == 0, subnorm, normal) * (
+            1.0 - 2.0 * sign.to(tl.float32)
+        )
 
         # Load UE8M0 scale: scale = 2^(stored_value - 127)
         encoded_scale = tl.load(token_scale_ptr + qblock_idx)
