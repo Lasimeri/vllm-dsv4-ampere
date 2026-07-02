@@ -20,10 +20,18 @@ ASYNC_FLAG=""
 [ "${ASYNC_SCHED:-1}" = "0" ] && ASYNC_FLAG="--no-async-scheduling"
 # EAGER=1 restores --enforce-eager; default uses breakable cudagraphs
 # (auto-enabled for DeepseekV4ForCausalLM via VLLM_USE_BREAKABLE_CUDAGRAPH).
+# CG_MODE=FULL captures the whole decode step as one graph
+# (FULL_DECODE_ONLY): requires the capture-safe SM86 decode path and
+# disables the breakable wrapper.
 EAGER_FLAG=""
 [ "${EAGER:-0}" = "1" ] && EAGER_FLAG="--enforce-eager"
+CC_FLAG=""
+if [ "${CG_MODE:-BREAKABLE}" = "FULL" ]; then
+  export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+  CC_FLAG='--compilation-config={"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
+fi
 exec .venv/bin/vllm serve deepseek-ai/DeepSeek-V4-Flash --trust-remote-code \
   --tensor-parallel-size 8 $EP_FLAG $PC_FLAG $ASYNC_FLAG --kv-cache-dtype fp8 --block-size 256 \
   --gpu-memory-utilization 0.88 --cpu-offload-gb 15 --max-num-seqs 1 --max-model-len 32768 \
-  --max-num-batched-tokens 2048 $EAGER_FLAG \
+  --max-num-batched-tokens 2048 $EAGER_FLAG $CC_FLAG \
   --host 0.0.0.0 --port 8001
