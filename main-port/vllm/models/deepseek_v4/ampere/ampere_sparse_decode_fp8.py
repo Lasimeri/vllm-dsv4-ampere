@@ -276,13 +276,32 @@ def ampere_sparse_decode_fp8(
         swa_valid, token_offsets.unsqueeze(1) + max_topk + swa_range, -1
     )
 
-    # Call BF16 sparse MLA kernel
-    out_attn, _, lse = triton_bf16_mla_sparse_interface(
-        q=q,
-        kv=workspace.unsqueeze(1),
-        indices=combined_indices.unsqueeze(1),
-        sm_scale=softmax_scale,
-        d_v=q.shape[-1],
-        block_dpe=0,
-    )
+    # Call BF16 sparse MLA kernel. The base kernel launches one program per
+    # (token, head-tile) -- a single program at batch-1 decode with 8 local
+    # heads. Split-K partitions the index columns across ~n_tiles programs
+    # (exact LSE merge, parity-tested), filling the SMs. VLLM_SM86_SPLITK=0
+    # restores the base kernel.
+    import os
+
+    if os.environ.get("VLLM_SM86_SPLITK", "1") == "1":
+        from vllm.models.deepseek_v4.ampere.ampere_sparse_splitk import (
+            triton_bf16_mla_sparse_splitk,
+        )
+
+        out_attn, _, lse = triton_bf16_mla_sparse_splitk(
+            q=q,
+            kv=workspace.unsqueeze(1),
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=softmax_scale,
+            d_v=q.shape[-1],
+        )
+    else:
+        out_attn, _, lse = triton_bf16_mla_sparse_interface(
+            q=q,
+            kv=workspace.unsqueeze(1),
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=softmax_scale,
+            d_v=q.shape[-1],
+            block_dpe=0,
+        )
     out.copy_(apply_attn_sink(out_attn, lse, attn_sink))
