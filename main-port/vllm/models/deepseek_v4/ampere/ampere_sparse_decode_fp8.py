@@ -186,18 +186,17 @@ def ampere_sparse_decode_fp8(
     topk_lens: torch.Tensor | None,
     swa_indices: torch.Tensor,  # [num_tokens, 1, swa_k] global slot IDs
     swa_lens: torch.Tensor,
-    attn_sink: torch.Tensor,
     softmax_scale: float,
     head_dim: int,
     nope_head_dim: int,
     rope_head_dim: int,
-    out: torch.Tensor,  # [num_tokens, num_heads, head_dim]
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Ampere decode: dequant FP8 pages to BF16, then BF16 sparse MLA attention.
 
     Keeps external FP8 KV cache layout identical to CUDA/ROCm.
-    Performance is slower due to on-the-fly dequant, but correctness is
-    guaranteed by reusing the validated BF16 attention kernel.
+    Returns ``(out, lse)`` -- the raw sink-less attention output plus the
+    exact natural-log LSE; the caller applies the attention sink and/or the
+    DCP LSE merge.
     """
     num_tokens = q.shape[0]
     device = q.device
@@ -304,4 +303,4 @@ def ampere_sparse_decode_fp8(
             d_v=q.shape[-1],
             block_dpe=0,
         )
-    out.copy_(apply_attn_sink(out_attn, lse, attn_sink))
+    return out_attn, lse

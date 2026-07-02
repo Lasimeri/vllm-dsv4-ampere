@@ -25,13 +25,16 @@ ASYNC_FLAG=""
 # disables the breakable wrapper.
 EAGER_FLAG=""
 [ "${EAGER:-0}" = "1" ] && EAGER_FLAG="--enforce-eager"
+# DCP=N enables decode context parallel (requires a2a comm backend).
+DCP_FLAG=""
+[ "${DCP:-1}" -gt 1 ] && DCP_FLAG="--decode-context-parallel-size ${DCP} --dcp-comm-backend a2a"
 CC_FLAG=""
 if [ "${CG_MODE:-BREAKABLE}" = "FULL" ]; then
   export VLLM_USE_BREAKABLE_CUDAGRAPH=0
   CC_FLAG='--compilation-config={"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
 fi
 exec .venv/bin/vllm serve deepseek-ai/DeepSeek-V4-Flash --trust-remote-code \
-  --tensor-parallel-size 8 $EP_FLAG $PC_FLAG $ASYNC_FLAG --kv-cache-dtype fp8 --block-size 256 \
+  --tensor-parallel-size 8 $EP_FLAG $PC_FLAG $ASYNC_FLAG $DCP_FLAG --kv-cache-dtype fp8 --block-size 256 \
   --gpu-memory-utilization 0.88 --cpu-offload-gb 15 --max-num-seqs 1 --max-model-len 32768 \
   --max-num-batched-tokens 2048 $EAGER_FLAG $CC_FLAG \
   --host 0.0.0.0 --port 8001

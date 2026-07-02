@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Ampere DeepSeek-V4 attention subclass.
-
-Subclasses the shared ``DeepseekV4Attention`` ABC and provides Ampere-native
-Triton kernels for decode (FP8 dequant + BF16 attention) and prefill
-(BF16 gathered KV + sparse attention).
-"""
 
 from typing import TYPE_CHECKING, cast
 
@@ -18,58 +12,78 @@ from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
+    dcp_merge_flashmla_output,
     dequantize_and_gather_k_cache,
 )
-from vllm.models.deepseek_v4.common.ops import dcp_merge_flashmla_output
+from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
+    compute_fp8_einsum_recipe,
+    deep_gemm_fp8_o_proj,
+)
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
 )
-from vllm.models.deepseek_v4.ampere.ampere_sparse_decode_fp8 import (
-    ampere_sparse_decode_fp8,
-    apply_attn_sink,
+from vllm.v1.attention.ops.flashmla import (
+    flash_mla_sparse_fwd,
+    flash_mla_with_kvcache,
 )
-from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
-class DeepseekV4AmpereSparseBackend(DeepseekV4FlashMLABackend):
-    @staticmethod
-    def get_name() -> str:
-        return "AMPERE_V4_MLA_SPARSE"
-
-    @classmethod
-    def supports_compute_capability(cls, capability) -> bool:
-        # SM8x (Ampere: A100 SM80, RTX 3080 SM86). The parent restricts to
-        # Hopper/Blackwell (9/10); this backend uses the portable Triton
-        # bf16 sparse-MLA kernel instead of FlashMLA/cutedsl, so it runs on 8.x.
-        return capability.major == 8
+def _squeeze_flashmla_lse(lse: torch.Tensor) -> torch.Tensor:
+    if lse.ndim == 3 and lse.shape[1] == 1:
+        return lse.squeeze(1)
+    if lse.ndim == 3 and lse.shape[-1] == 1:
+        return lse.squeeze(-1)
+    assert lse.ndim == 2, f"Unexpected FlashMLA LSE shape: {tuple(lse.shape)}"
+    return lse
 
 
 def _maybe_gather_dcp_q(
-    layer: "DeepseekV4AmpereAttention",
+    layer: "DeepseekV4FlashMLAAttention",
     q: torch.Tensor,
-) -> tuple[torch.Tensor, int, "GroupCoordinator", bool]:
-    """All-gather the real query heads across the DCP group.
-
-    Mirrors the nvidia backend: each DCP rank attends its KV shard with ALL
-    heads of the group, then the LSE merge redistributes per-head outputs.
-    """
+) -> tuple[torch.Tensor, int, GroupCoordinator, bool]:
     dcp_group = get_dcp_group()
     if dcp_group.world_size == 1:
         return q, layer.n_local_heads, dcp_group, False
+
+    # Gather only real heads. Gathering FlashMLA-padded local heads would make
+    # h_q = padded_heads * dcp_world_size, which breaks DCP>2 and treats
+    # padding as real heads.
     q = dcp_group.all_gather(q[:, : layer.n_local_heads, :].contiguous(), dim=1)
-    return q, q.shape[1], dcp_group, True
+    num_real_heads = q.shape[1]
+    padded_heads = layer.get_padded_num_q_heads(num_real_heads)
+    if num_real_heads < padded_heads:
+        q_padded = q.new_zeros((q.shape[0], padded_heads, q.shape[2]))
+        q_padded[:, :num_real_heads, :] = q
+        q = q_padded
+    return q, num_real_heads, dcp_group, True
 
 
-class DeepseekV4AmpereAttention(DeepseekV4Attention):
-    """Ampere sparse MLA attention layer for DeepSeek V4."""
+def _squeeze_flashmla_out(out: torch.Tensor) -> torch.Tensor:
+    if out.ndim == 4 and out.shape[1] == 1:
+        return out.squeeze(1)
+    assert out.ndim == 3, f"Unexpected FlashMLA output shape: {tuple(out.shape)}"
+    return out
 
-    backend_cls = DeepseekV4AmpereSparseBackend
-    use_flashmla_fp8_layout = True
+
+def _get_dcp_flashmla_partials(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    num_real_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = _squeeze_flashmla_out(out)[:, :num_real_heads, :]
+    lse = _squeeze_flashmla_lse(lse)[:, :num_real_heads]
+    return out, lse
+
+
+class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
+    """FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA)."""
+
+    backend_cls = DeepseekV4FlashMLABackend
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -78,69 +92,34 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             parallel_config.decode_context_parallel_size > 1
             and parallel_config.dcp_comm_backend != "a2a"
         ):
-            raise ValueError(
-                "DeepseekV4 Ampere DCP requires dcp_comm_backend='a2a'."
-            )
-        self._sink_neg_inf: torch.Tensor | None = None
+            raise ValueError("DeepseekV4 FlashMLA DCP requires dcp_comm_backend='a2a'.")
+        self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
 
-    def _merge_sink(self) -> torch.Tensor:
-        """Sink tensor for the DCP merge: the trained sink when the env gate
-        is on, an all--inf tensor (exact no-op in logaddexp) otherwise."""
-        import os
-
-        if os.environ.get("VLLM_SM86_SINK", "0") == "1":
-            return self.attn_sink
-        if self._sink_neg_inf is None:
-            self._sink_neg_inf = torch.full_like(self.attn_sink, float("-inf"))
-        return self._sink_neg_inf
-
-    def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
-        from typing import cast
-
-        if not isinstance(attn_metadata, dict):
-            # Profile run: no-op, just return q (no padding needed on Ampere).
-            return q
-
-        swa_metadata = cast(
-            "DeepseekSparseSWAMetadata | None",
-            attn_metadata.get(self.swa_cache_layer.prefix),
-        )
-        assert swa_metadata is not None
-
-        from vllm.models.deepseek_v4.ampere.ampere_qnorm_rope_kv_fp8_insert import (
-            ampere_qnorm_rope_kv_fp8_insert,
-        )
-
-        ampere_qnorm_rope_kv_fp8_insert(
-            q,
-            kv,
-            self.swa_cache_layer.kv_cache,
-            swa_metadata.slot_mapping,
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return deep_gemm_fp8_o_proj(
+            o,
             positions,
             self.rotary_emb.cos_sin_cache,
-            self.eps,
-            swa_metadata.block_size,
+            self.wo_a,
+            self.wo_b,
+            n_groups=self.n_local_groups,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            o_lora_rank=self.o_lora_rank,
+            einsum_recipe=self._einsum_recipe,
+            tma_aligned_scales=self._tma_aligned_scales,
         )
-        return q
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
-        return num_heads
-
-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        # Ampere uses BF16 reference wo_a path (same as ROCm).
-        from vllm.models.deepseek_v4.amd.rocm import rocm_inv_rope_einsum
-
-        z = rocm_inv_rope_einsum(
-            self.rotary_emb,
-            o,
-            positions,
-            self.rope_head_dim,
-            self.n_local_groups,
-            self.o_lora_rank,
-            self.wo_a,
-        )
-        return self.wo_b(z.flatten(1))
+        # FP8 decode kernel only supports h_q = 64 or 128.
+        if num_heads > 128:
+            raise ValueError(
+                f"DeepseekV4 FlashMLA does not support {num_heads} heads "
+                "(FP8 decode kernel requires h_q in {64, 128})."
+            )
+        return 64 if num_heads <= 64 else 128
 
     def forward_mqa(
         self,
@@ -156,11 +135,14 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
             f"output buffer dtype {output.dtype} must match q dtype {q.dtype}"
         )
 
+        # Get SWA and indexer metadata from forward context
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # Warmup dummy run: reserve workspace, skip actual kernels.
+            # Warmup dummy run: no real metadata. Reserve the same bf16
+            # gather workspace _forward_prefill would; the dequantize / topk
+            # / sparse_fwd kernels are skipped this step.
             swa_only = self.compress_ratio <= 1
             N = (
                 0
@@ -169,9 +151,19 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
                 // self.compress_ratio
             )
             M = N + self.window_size + self.max_num_batched_tokens
-            current_workspace_manager().get_simultaneous(
-                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )
+            dcp_group = get_dcp_group()
+            if dcp_group.world_size > 1:
+                dcp_q_heads = self.get_padded_num_q_heads(
+                    self.n_local_heads * dcp_group.world_size
+                )
+                current_workspace_manager().get_simultaneous(
+                    ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                    ((q.shape[0], dcp_q_heads, q.shape[2]), q.dtype),
+                )
+            else:
+                current_workspace_manager().get_simultaneous(
+                    ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                )
             output.zero_()
             return
 
@@ -186,6 +178,8 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         assert swa_metadata is not None
 
         swa_only = self.compress_ratio <= 1
+        # SWA-only layers (compress_ratio <= 1) don't have their own KV cache
+        # allocation, so self.kv_cache may be empty after profiling cleanup.
         self_kv_cache = self.kv_cache if not swa_only else None
         swa_kv_cache = self.swa_cache_layer.kv_cache
 
@@ -217,7 +211,7 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
     def _forward_decode(
         self,
         q: torch.Tensor,
-        kv_cache: torch.Tensor | None,
+        kv_cache: torch.Tensor | None,  # Only used when compress_ratio > 1
         swa_metadata: "DeepseekSparseSWAMetadata",
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_only: bool,
@@ -243,8 +237,6 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
                     block_size,
                     is_valid,
                 )
-                # Uniform-width buffer (PR #44573): under DCP the local topk
-                # width varies per rank; keep the full buffer width, -1 padded.
                 topk_indices = self.topk_indices_buffer[:num_decode_tokens]
                 topk_indices.fill_(-1)
                 topk_indices[:, : global_indices.shape[-1]].copy_(global_indices)
@@ -257,38 +249,81 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
 
-        assert swa_indices is not None and swa_lens is not None
+        # We treat queries in the same seq as different queries
+        # and later we only attend by generated indices.
         q, num_real_heads, dcp_group, use_dcp = _maybe_gather_dcp_q(self, q)
-        out_attn, lse = ampere_sparse_decode_fp8(
+        q = q.unsqueeze(1)
+
+        # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
+        # Use unsqueeze to preserve strides (handles padded blocks correctly)
+        swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
+        # Reshape KV cache to (num_blocks, block_size, 1, head_bytes)
+        if kv_cache is not None:
+            kv_cache = kv_cache.unsqueeze(-2)
+
+        # One FlashMLASchedMeta per layer type, shared across all same-type
+        # layers within this decode step. The first forward call per type
+        # triggers the in-kernel planner (allocating tile_scheduler_metadata
+        # and num_splits via PyTorch's graph-aware allocator so CUDA graph
+        # capture reuses the same addresses on replay); subsequent same-type
+        # layers see have_initialized=True and skip the planner.
+        if self.compress_ratio <= 1:
+            tile_metadata = swa_metadata.tile_sched_swaonly
+        elif self.compress_ratio == 4:
+            tile_metadata = swa_metadata.tile_sched_c4a
+        elif self.compress_ratio == 128:
+            tile_metadata = swa_metadata.tile_sched_c128a
+        else:
+            raise ValueError(
+                f"Unsupported compress_ratio={self.compress_ratio}; "
+                "expected 1, 4, or 128."
+            )
+        assert tile_metadata is not None, (
+            "swa_metadata missing tile_sched entry for "
+            f"compress_ratio={self.compress_ratio}; "
+            "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
+            "allocate one for this layer type."
+        )
+
+        out_buffer = output.unsqueeze(1)
+        if use_dcp:
+            (out_buffer,) = current_workspace_manager().get_simultaneous(
+                ((q.shape[0], q.shape[1], q.shape[2], q.shape[3]), q.dtype),
+            )
+            out_buffer.zero_()
+
+        out, lse = flash_mla_with_kvcache(
             q=q,
-            kv_cache=kv_cache,
-            swa_kv_cache=self.swa_cache_layer.kv_cache,
-            swa_only=swa_only,
-            topk_indices=topk_indices,
-            topk_lens=topk_lens,
-            swa_indices=swa_indices,
-            swa_lens=swa_lens,
+            k_cache=swa_cache,
+            block_table=None,
+            head_dim_v=512,
+            tile_scheduler_metadata=tile_metadata,
+            cache_seqlens=None,
+            is_fp8_kvcache=True,
+            indices=swa_indices,
+            topk_length=swa_lens,
             softmax_scale=self.scale,
-            head_dim=self.head_dim,
-            nope_head_dim=self.nope_head_dim,
-            rope_head_dim=self.rope_head_dim,
+            attn_sink=None if use_dcp else self.attn_sink,
+            extra_k_cache=kv_cache if not swa_only else None,
+            extra_indices_in_kvcache=topk_indices,
+            extra_topk_length=topk_lens,
+            out=out_buffer,
         )
         if use_dcp:
+            out, lse = _get_dcp_flashmla_partials(out, lse, num_real_heads)
             dcp_merge_flashmla_output(
-                out_attn[:, :num_real_heads, :],
-                lse[:, :num_real_heads],
-                self._merge_sink(),
+                out,
+                lse,
+                self.attn_sink,
                 output,
                 dcp_group,
             )
-        else:
-            output.copy_(apply_attn_sink(out_attn, lse, self.attn_sink))
 
     def _forward_prefill(
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
-        compressed_k_cache: torch.Tensor | None,
+        compressed_k_cache: torch.Tensor | None,  # Only used when compress_ratio > 1
         swa_k_cache: torch.Tensor,
         output: torch.Tensor,
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
@@ -296,7 +331,6 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
     ) -> None:
         swa_only = attn_metadata is None
 
-        num_prefills = swa_metadata.num_prefills
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
@@ -304,25 +338,9 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens
         gather_lens = swa_metadata.prefill_gather_lens
-
-        q, num_real_heads, dcp_group, use_dcp = _maybe_gather_dcp_q(self, q)
-
-        import os
-
-        if (
-            os.environ.get("VLLM_SM86_NAN_PROBE") == "1"
-            and self.prefix.endswith("layers.0.attn")
-        ):
-            bt = swa_metadata.block_table[num_decodes:]
-            print(
-                f"[SWA_META] seq_lens={seq_lens.tolist() if seq_lens is not None else None} "
-                f"gather_lens={gather_lens.tolist() if gather_lens is not None else None} "
-                f"block_table_row0={bt[0, :6].tolist() if bt.numel() else '?'} "
-                f"slot_map[:8]={swa_metadata.slot_mapping[:8].tolist()}",
-                flush=True,
-            )
         assert seq_lens is not None
         assert gather_lens is not None
+        q, num_real_heads, dcp_group, use_dcp = _maybe_gather_dcp_q(self, q)
 
         # Derive prefill-local token offsets from the full query_start_loc_cpu.
         query_start_loc_cpu = swa_metadata.query_start_loc_cpu
@@ -341,25 +359,39 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
                 assert attn_metadata is not None
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
             top_k = topk_indices.shape[-1]
-            N = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
         else:
+            # NOTE(woosuk): topk_indices will not be used for SWA-only layers.
             assert self.topk_indices_buffer is not None
             topk_indices = self.topk_indices_buffer[num_decode_tokens:]
             top_k = 0
-            N = 0
-
-        M = N + self.window_size + self.max_num_batched_tokens
-        chunk_size_const = self.PREFILL_CHUNK_SIZE
-        num_chunks = (num_prefills + chunk_size_const - 1) // chunk_size_const
-
+        chunk_plan = swa_metadata.get_prefill_chunk_plan(
+            compress_ratio=self.compress_ratio,
+            prefill_chunk_size=self.PREFILL_CHUNK_SIZE,
+        )
+        assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
         workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((chunk_size_const, M, q.shape[-1]), torch.bfloat16),
-        )[0]
-        for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * chunk_size_const
-            chunk_end = min(chunk_start + chunk_size_const, num_prefills)
+        for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
             chunk_size = chunk_end - chunk_start
+            query_start = int(
+                (
+                    query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+                ).item()
+            )
+            query_end = int(
+                (
+                    query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+                ).item()
+            )
+            if use_dcp:
+                kv, dcp_out = workspace_manager.get_simultaneous(
+                    ((chunk_size, chunk_M, q.shape[-1]), torch.bfloat16),
+                    ((query_end - query_start, q.shape[1], q.shape[2]), q.dtype),
+                )
+            else:
+                (kv,) = workspace_manager.get_simultaneous(
+                    ((chunk_size, chunk_M, q.shape[-1]), torch.bfloat16),
+                )
+                dcp_out = None
             if not swa_only:
                 # Gather compressed KV
                 assert attn_metadata is not None
@@ -384,18 +416,11 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
                 gather_lens=gather_lens[chunk_start:chunk_end],
                 block_table=swa_block_table[chunk_start:chunk_end],
                 block_size=swa_metadata.block_size,
-                offset=N,
+                offset=chunk_N,
                 cp_layout=self.cp_layout,
             )
 
             # Combine the topk indices and SWA indices for gathered KV cache
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
-            )
-
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
                 query_start_loc[
@@ -406,29 +431,31 @@ class DeepseekV4AmpereAttention(DeepseekV4Attention):
                 self.window_size,
                 self.compress_ratio,
                 top_k,
-                M,
-                N,
+                chunk_M,
+                chunk_N,
                 cp_layout=self.cp_layout,
             )
-
-            kv_ws = kv[:chunk_size].reshape(-1, 1, q.shape[-1])
-            out, _, lse = triton_bf16_mla_sparse_interface(
+            out_buffer = output[query_start:query_end]
+            if use_dcp:
+                assert dcp_out is not None
+                out_buffer = dcp_out
+                out_buffer.zero_()
+            out, _, lse = flash_mla_sparse_fwd(
                 q=q[query_start:query_end],
-                kv=kv_ws,
+                kv=kv.view(-1, 1, q.shape[-1]),
                 indices=combined_indices.unsqueeze(1),
                 sm_scale=self.scale,
-                d_v=q.shape[-1],
-                block_dpe=0,
+                attn_sink=None if use_dcp else self.attn_sink,
+                topk_length=combined_lens,
+                out=out_buffer,
             )
             if use_dcp:
+                out, lse = _get_dcp_flashmla_partials(out, lse, num_real_heads)
                 dcp_merge_flashmla_output(
-                    out[:, :num_real_heads, :],
-                    lse[:, :num_real_heads],
-                    self._merge_sink(),
+                    out,
+                    lse,
+                    self.attn_sink,
                     output[query_start:query_end],
                     dcp_group,
-                )
-            else:
-                output[query_start:query_end] = apply_attn_sink(
-                    out, lse, self.attn_sink
+                    use_a2a=False,
                 )
