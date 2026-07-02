@@ -19,6 +19,9 @@ import torch
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
+from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
+    _fp32_to_fp8_e4m3fn_byte,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
@@ -44,6 +47,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    use_manual_e4m3: tl.constexpr = False,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -121,11 +125,15 @@ def quantize_and_insert_k_kernel(
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
+            # SM8x Triton cannot emit fp8e4nv casts; encode e4m3fn manually.
             if use_fnuz:
                 x_fp8 = x_clamped.to(tl.float8e4b8)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+            elif use_manual_e4m3:
+                x_uint8 = _fp32_to_fp8_e4m3fn_byte(x_clamped.to(tl.float32))
             else:
                 x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -262,10 +270,14 @@ def quantize_and_insert_k_cache(
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
 
-    if current_platform.is_cuda() and (
+    # SM8x (Ampere): the Triton kernel works but must encode e4m3fn manually
+    # (no fp8e4nv casts). Capture-safe, unlike the torch pyref (.nonzero()).
+    use_manual_e4m3 = current_platform.is_cuda() and (
         current_platform.get_device_capability()[0] < 9
-    ):
-        # SM8x (Ampere): Triton cannot emit fp8e4nv; quant + scatter in torch.
+    )
+    import os
+
+    if use_manual_e4m3 and os.environ.get("VLLM_SM86_KINS_TORCH") == "1":
         _quantize_and_insert_k_cache_sm86_pyref(k, k_cache, slot_mapping, block_size)
         return
 
@@ -304,6 +316,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        use_manual_e4m3=use_manual_e4m3,
     )
 
 

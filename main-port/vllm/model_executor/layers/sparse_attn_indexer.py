@@ -579,12 +579,21 @@ def sparse_attn_indexer(
             current_platform.get_device_capability()[0] < 9
         ):
             # SM8x (Ampere): deep_gemm paged MQA logits asserts "Unsupported
-            # architecture"; dequant fp8->bf16 and run the einsum in torch.
+            # architecture"; use the capture-safe Triton kernel (manual e4m3
+            # decode, static grid) so decode can run under cudagraph.
+            import os as _os
+
             from vllm.models.deepseek_v4.ampere.ampere_indexer_logits import (
                 _fp8_paged_mqa_logits_pyref,
+                fp8_paged_mqa_logits_sm86_triton,
             )
 
-            logits = _fp8_paged_mqa_logits_pyref(
+            _idx_fn = (
+                _fp8_paged_mqa_logits_pyref
+                if _os.environ.get("VLLM_SM86_IDX_PYREF") == "1"
+                else fp8_paged_mqa_logits_sm86_triton
+            )
+            logits = _idx_fn(
                 padded_q_quant_cast,
                 kv_cache,
                 weights[:num_padded_tokens],

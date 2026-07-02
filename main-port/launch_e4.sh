@@ -18,8 +18,12 @@ PC_FLAG=""
 [ "${PREFIX_CACHE:-1}" = "0" ] && PC_FLAG="--no-enable-prefix-caching"
 ASYNC_FLAG=""
 [ "${ASYNC_SCHED:-1}" = "0" ] && ASYNC_FLAG="--no-async-scheduling"
+# EAGER=1 restores --enforce-eager; default uses breakable cudagraphs
+# (auto-enabled for DeepseekV4ForCausalLM via VLLM_USE_BREAKABLE_CUDAGRAPH).
+EAGER_FLAG=""
+[ "${EAGER:-0}" = "1" ] && EAGER_FLAG="--enforce-eager"
 exec .venv/bin/vllm serve deepseek-ai/DeepSeek-V4-Flash --trust-remote-code \
   --tensor-parallel-size 8 $EP_FLAG $PC_FLAG $ASYNC_FLAG --kv-cache-dtype fp8 --block-size 256 \
   --gpu-memory-utilization 0.88 --cpu-offload-gb 15 --max-num-seqs 1 --max-model-len 32768 \
-  --max-num-batched-tokens 2048 --enforce-eager \
+  --max-num-batched-tokens 2048 $EAGER_FLAG \
   --host 0.0.0.0 --port 8001
