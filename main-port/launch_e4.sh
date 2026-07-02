@@ -35,6 +35,7 @@ if [ "${CG_MODE:-BREAKABLE}" = "FULL" ]; then
 fi
 exec .venv/bin/vllm serve deepseek-ai/DeepSeek-V4-Flash --trust-remote-code \
   --tensor-parallel-size 8 $EP_FLAG $PC_FLAG $ASYNC_FLAG $DCP_FLAG --kv-cache-dtype fp8 --block-size 256 \
-  --gpu-memory-utilization 0.88 --cpu-offload-gb 15 --max-num-seqs 1 --max-model-len 32768 \
+  --gpu-memory-utilization 0.88 --cpu-offload-gb 15 --max-num-seqs 1 \
+  --max-model-len "${MAXLEN:-32768}" \
   --max-num-batched-tokens 2048 $EAGER_FLAG $CC_FLAG \
   --host 0.0.0.0 --port 8001
